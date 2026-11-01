@@ -7,7 +7,10 @@ const uid = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() : Ma
 const fdt = (ts) => { const d = new Date(ts); return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }) + " " + d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); };
 const fd = (ts) => (ts ? new Date(ts).toLocaleDateString("ru-RU") : "—");
 
-let S = { role: null, drinks: [], shop: "", setup_needed: false, local: false, tls_port: 0, offline: false };
+let S = {
+  role: null, drinks: [], shop: "", setup_needed: false, local: false, tls_port: 0,
+  offline: true, sync: "LOCAL_ONLY", syncError: "", storageError: "", reauthRequired: false,
+};
 let C = null;          // открытая карточка клиента
 let cart = {};         // drink id -> половинки литра
 let selDrink = null;
@@ -61,9 +64,10 @@ async function api(path, body, mutation) {
   let j = {};
   try { j = await r.json(); } catch (e) { /* не JSON */ }
   if (r.status === 401 && path !== "login") {
-    await Offline.rememberAuthentication(false);
-    S.role = null; render();
-    const err = new Error("Сессия закончилась. Введите PIN.");
+    await Offline.clearAuthToken();
+    S.reauthRequired = true;
+    render();
+    const err = new Error("Серверная сессия закончилась. Офлайн-работа и очередь сохранены; войдите снова для синхронизации.");
     err.auth = true; err.status = r.status; throw err;
   }
   if (r.status === 503 && j.locked) { S.locked = j.locked; render(); throw new Error(j.error); }
@@ -79,8 +83,8 @@ async function apiBlob(path) {
   if (token) headers.Authorization = "Bearer " + token;
   const response = await fetch(await apiUrl(path), { credentials: "omit", headers });
   if (response.status === 401) {
-    await Offline.rememberAuthentication(false);
-    S.role = null;
+    await Offline.clearAuthToken();
+    S.reauthRequired = true;
     render();
     throw new Error("Сессия закончилась. Войдите снова.");
   }
@@ -100,25 +104,20 @@ async function mut(key, path, body) {
     customerId = path.split("/")[1];
   }
   if (type) {
-    const queued = await Offline.enqueue(type, customerId, payload, Offline.requestOperationId());
-    let syncResult = null;
-    try {
-      syncResult = await Offline.synchronize(api);
-      S.offline = !navigator.onLine || syncResult.reason === "offline";
-      S.syncError = null;
-    } catch (e) {
-      S.offline = true;
-      S.syncError = e.message;
-    }
-    const customer = await Offline.getCustomer(customerId);
-    const pending = await Offline.outboxCount();
-    const syncedCustomer = customer || queued.customer;
+    const operationId = await Offline.requestIdForKey("offline:" + key);
+    const queued = await Offline.enqueue(type, customerId, payload, operationId);
+    if (queued.customer && type !== "register") C = queued.customer;
+    S.sync = "PENDING";
+    S.offline = true;
+    await updateOfflineStatus();
+    retrySynchronization();
+    const syncedCustomer = queued.customer || await Offline.getCustomer(queued.operation.customer_id);
     if (type === "register") return syncedCustomer;
     return {
       customer: syncedCustomer,
       offers: queued.offers || [],
       replay: !!queued.existing,
-      pending: !!pending,
+      pending: true,
       syncError: S.syncError,
     };
   }
@@ -152,7 +151,10 @@ async function guard(fn) {
   try { await fn(); } catch (e) { toast(e.message, true); } finally { busy = false; }
 }
 async function refreshState() {
-  Object.assign(S, await api("state"));
+  const localRole = S.role;
+  const state = await api("state");
+  Object.assign(S, state);
+  if (!S.role && localRole) S.role = localRole;
   if (S.role) await Offline.cacheProducts(S);
 }
 
@@ -162,59 +164,119 @@ const go = (h) => { if (location.hash === "#" + h) render(); else location.hash 
 window.addEventListener("hashchange", () => { cart = {}; selDrink = null; render(); });
 
 async function boot() {
-  await Offline.open();
-  await Offline.persistentStorage();
-  S.server_url = await Offline.serverUrl();
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => 0);
-  if (isPagesHost && !(await Offline.serverUrl())) {
-    $("#app").innerHTML = viewConnection();
+  try {
+    await Offline.open();
+    await Offline.persistentStorage();
+    if ("serviceWorker" in navigator) registerApplicationWorker();
+    const cached = await Offline.bootstrap();
+    S.server_url = cached.server_url;
+    if (cached.authenticated && cached.config) {
+      S.role = "staff";
+      S.shop = cached.config.shop;
+      S.drinks = cached.config.drinks.filter((drink) => drink.active !== false);
+      S.sync = "LOCAL_ONLY";
+      S.offline = true;
+      await updateOfflineStatus();
+    }
+    if (isPagesHost && !S.server_url && !S.role) {
+      $("#app").innerHTML = viewConnection();
+      return;
+    }
+    await render();
+    if (S.server_url) probeServer();
+  } catch (e) {
+    S.storageError = Offline.storageError ? Offline.storageError.message : e.message;
+    $("#app").innerHTML = viewStorageFailure();
+    toast(S.storageError, true);
     return;
   }
-  let unavailable = false;
-  try { await refreshState(); } catch (e) { unavailable = true; }
-  if (!S.role && (unavailable || !navigator.onLine)) {
-    try {
-      const cached = await Offline.bootstrap();
-      if (cached.authenticated && cached.config) {
-        S.role = "staff";
-        S.shop = cached.config.shop;
-        S.drinks = cached.config.drinks.filter((drink) => drink.active !== false);
-        S.offline = true;
+}
+
+function registerApplicationWorker() {
+  navigator.serviceWorker.register("./sw.js").then((registration) => {
+    const activateVerifiedUpdate = (worker) => {
+      if (worker && worker.state === "installed" && navigator.serviceWorker.controller) {
+        worker.postMessage("ACTIVATE_AFTER_VERIFY");
       }
-    } catch (e) { toast(e.message, true); }
-  }
-  if (S.role && navigator.onLine) {
-    try {
-      await Offline.synchronize(api);
-      S.offline = false;
-      S.syncError = null;
-    } catch (e) {
+    };
+    activateVerifiedUpdate(registration.waiting);
+    registration.addEventListener("updatefound", () => {
+      const installing = registration.installing;
+      if (!installing) return;
+      installing.addEventListener("statechange", () => activateVerifiedUpdate(registration.waiting));
+    });
+    registration.update().catch(() => {});
+  }).catch((error) => {
+    console.error("Service worker registration failed", error);
+  });
+}
+
+async function probeServer() {
+  try {
+    const state = await api("state");
+    const wasAuthenticated = !!S.role;
+    Object.assign(S, state);
+    if (wasAuthenticated) S.role = "staff";
+    if (S.role) {
+      await Offline.cacheProducts(S);
+      await retrySynchronization();
+    } else {
+      S.sync = "LOCAL_ONLY";
       S.offline = true;
-      S.syncError = e.message;
+      if (!wasAuthenticated) render();
     }
+  } catch (error) {
+    S.sync = "LOCAL_ONLY";
+    S.offline = true;
+    S.syncError = error.message;
+    if (S.role) render();
   }
-  await updateOfflineStatus();
-  render();
+}
+
+function viewStorageFailure() {
+  return `<div class="top"><div class="t">Локальные данные недоступны</div></div>
+    <div class="warn"><b>Работа остановлена.</b> ${esc(S.storageError || "Не удалось безопасно открыть локальную базу.")}</div>
+    <div class="card">Не очищайте данные сайта и не переустанавливайте PWA. Проверьте прежний адрес сайта/браузер или восстановите клиентов с ноутбука. Если операции ожидают отправки, сначала используйте экспорт на исходном устройстве.</div>`;
 }
 
 function offlineNotice() {
-  if (!S.offline && !S.pendingCount) return "";
-  const heading = S.offline ? "Офлайн-режим." : `Ожидает синхронизации: ${S.pendingCount}.`;
-  const detail = S.offline ? "Данные и покупки сохраняются на этом телефоне и будут отправлены при восстановлении связи."
-    : "Проверьте сеть и сервер; ожидающие операции остаются на телефоне.";
-  return `<div class="warn offline-note"><b>${heading}</b> ${detail}${S.syncError ? `<br>${esc(S.syncError)}` : ""}${S.pendingError ? `<br>⚠ ${esc(S.pendingError)}` : ""}</div>`;
+  if (S.sync === "ONLINE" && !S.pendingCount) return "";
+  const states = {
+    LOCAL_ONLY: ["Нет связи с ноутбуком.", "Локальные данные доступны; операции останутся на этом телефоне."],
+    SYNCING: ["Синхронизация.", "Локальные операции сохранены."],
+    PENDING: [`Ожидает синхронизации: ${S.pendingCount}.`, "Операции сохранены на телефоне."],
+    SYNC_ERROR: ["Ошибка синхронизации.", "Данные и очередь сохранены; повтор будет выполнен автоматически."],
+    CONFLICT: ["Есть конфликт синхронизации.", "Откройте настройки, просмотрите ошибку и экспортируйте очередь."],
+  };
+  const [heading, detail] = states[S.sync] || states.LOCAL_ONLY;
+  return `<div class="warn offline-note"><b>${heading}</b> ${detail}${S.syncError ? `<br>${esc(S.syncError)}` : ""}${S.pendingError ? `<br>⚠ ${esc(S.pendingError)}` : ""}${S.reauthRequired ? `<br><button class="btn sm" data-act="reauth">Войти на сервер снова</button>` : ""}</div>`;
+}
+function refreshSyncNotice() {
+  const notice = document.querySelector(".offline-note");
+  const html = offlineNotice();
+  if (notice) {
+    if (html) notice.outerHTML = html;
+    else notice.remove();
+  } else if (html) {
+    const top = document.querySelector("#app .top");
+    if (top) top.insertAdjacentHTML("afterend", html);
+  }
 }
 async function updateOfflineStatus() {
   const entries = await Offline.pending();
   S.pendingCount = entries.length;
-  S.pendingError = (entries.find((entry) => entry.last_error) || {}).last_error?.message || "";
+  const failed = entries.find((entry) => entry.last_error) || null;
+  S.pendingError = failed ? failed.last_error.message : "";
+  if (failed && failed.last_error.conflict) S.sync = "CONFLICT";
+  else if (S.sync === "ONLINE" && entries.length) S.sync = "PENDING";
 }
 
 async function render() {
   const app = $("#app");
   app.style.paddingBottom = "";
+  if (S.storageError) return (app.innerHTML = viewStorageFailure());
   if (S.locked) return await viewLocked();
-  if (isPagesHost && !(await Offline.serverUrl())) return (app.innerHTML = viewConnection());
+  if (isPagesHost && !(await Offline.serverUrl()) && !S.role) return (app.innerHTML = viewConnection());
   if (S.setup_needed) return (app.innerHTML = viewSetup());
   if (!S.role) return (app.innerHTML = viewLogin());
   const r = route();
@@ -224,8 +286,6 @@ async function render() {
     if (r[0] === "stats") return await viewStats("week");
     if (r[0] === "customers") return await viewCustomers();
     if (r[0] === "settings") return await viewSettings();
-    await refreshState().catch((e) => { if (e.net) S.offline = true; });
-    if (!S.role) return (app.innerHTML = viewLogin());
     app.innerHTML = viewHome(); loadSearch(lastQuery);
   } catch (e) { toast(e.message, true); if (r.length) go("/"); }
 }
@@ -290,15 +350,26 @@ async function loadSearch(q) {
   lastQuery = q;
   const box = $("#results"); if (!box) return;
   let j;
+  if (S.sync !== "ONLINE") {
+    try { j = await Offline.search(q); }
+    catch (e) { box.innerHTML = `<div class="warn">${esc(e.message)}</div>`; return; }
+    if (q !== lastQuery || !$("#results")) return;
+    paintSearchResults(box, j);
+    return;
+  }
   try { j = await api("search?q=" + encodeURIComponent(q)); }
   catch (e) {
-    if (!e.net) { toast(e.message, true); return; }
+    if (!e.net && !e.auth) { toast(e.message, true); return; }
     try { j = await Offline.search(q); S.offline = true; await updateOfflineStatus(); }
     catch (e) { box.innerHTML = `<div class="warn">${esc(e.message)}</div>`; return; }
+    S.sync = "LOCAL_ONLY";
   }
   if (!j || q !== lastQuery || !$("#results")) return;
+  paintSearchResults(box, j);
+}
+function paintSearchResults(box, j) {
   if (!j.results.length) {
-    box.innerHTML = q ? `<div class="card center mute">Не найдено.<br><button class="btn primary" style="margin-top:10px" data-act="newc">Зарегистрировать</button></div>` : `<div class="card center mute">Введите номер телефона или фамилию, либо отсканируйте QR</div>`;
+    box.innerHTML = lastQuery ? `<div class="card center mute">Не найдено.<br><button class="btn primary" style="margin-top:10px" data-act="newc">Зарегистрировать</button></div>` : `<div class="card center mute">Введите номер телефона или фамилию, либо отсканируйте QR</div>`;
     return;
   }
   box.innerHTML = (j.recent ? `<h2>Недавние</h2>` : "") + `<div class="list">` + j.results.map((c) =>
@@ -336,13 +407,21 @@ async function loadQrImage(id) {
 
 // ---------- карточка клиента
 async function viewCustomer(id) {
-  try { await refreshState(); }
-  catch (e) { if (!e.net) throw e; S.offline = true; }
+  if (S.sync !== "ONLINE") {
+    C = await Offline.getCustomer(id);
+    if (C) {
+      S.sync = S.sync || "LOCAL_ONLY";
+      S.offline = true;
+      paintCustomer();
+      return;
+    }
+  }
   try {
     C = await api("customers/" + encodeURIComponent(id));
     await Offline.cacheCustomer(C);
   } catch (e) {
-    if (!e.net) throw e;
+    if (!e.net && !e.auth) throw e;
+    S.sync = "LOCAL_ONLY";
     S.offline = true;
     C = await Offline.getCustomer(id);
     if (!C) throw new Error("Клиент не сохранён на этом телефоне. Подключитесь к серверу и повторите.");
@@ -503,8 +582,10 @@ function paintCl() {
 async function viewSettings() {
   const configuredServer = await Offline.serverUrl();
   let j = null;
-  try { j = await api("settings"); }
-  catch (e) { if (!S.offline) throw e; }
+  if (S.sync === "ONLINE") {
+    try { j = await api("settings"); }
+    catch (e) { if (!e.net && !e.auth) throw e; }
+  }
   await updateOfflineStatus();
   if (!j) {
     const cached = await Offline.bootstrap();
@@ -516,6 +597,7 @@ async function viewSettings() {
       <div class="card"><b>Локальные данные</b><div class="mute">Сохранено напитков: ${cached.config ? cached.config.drinks.length : 0}<br>Последний применённый курсор: ${cached.cursor}</div>
       <button class="btn primary block" style="margin-top:10px" data-act="syncnow">Синхронизировать сейчас</button>
       <button class="btn block" style="margin-top:8px" data-act="exportpending">Экспортировать ожидающие операции</button></div>
+      ${S.reauthRequired ? `<div class="card"><b>Требуется вход на сервер</b><p class="mute">Локальная сессия и ожидающие операции сохранены.</p><button class="btn primary block" data-act="reauth">Войти на сервер</button></div>` : ""}
       <div class="card mute">PIN и серверные настройки доступны при подключении к компьютеру магазина.</div>`;
     return;
   }
@@ -611,15 +693,15 @@ document.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.
 async function doLogin() {
   const j = await api("login", { pin: $("#pin").value });
   S.role = j.role;
+  S.reauthRequired = false;
   await Offline.rememberAuthentication(true, j.token);
   await refreshState();
   try {
+    S.sync = "SYNCING";
     await Offline.synchronize(api);
-    S.offline = false;
-    S.syncError = null;
+    await finishSyncState();
   } catch (e) {
-    S.offline = true;
-    S.syncError = e.message;
+    await failSyncState(e);
   }
   await updateOfflineStatus();
   render();
@@ -652,7 +734,18 @@ document.addEventListener("click", (e) => {
       closeModal();
       await api("logout", {}).catch(() => 0);
       await Offline.rememberAuthentication(false);
-      S.role = null; S.drinks = []; render();
+      S.role = null; S.drinks = []; S.sync = "LOCAL_ONLY"; render();
+    });
+    case "reauth": return modal(`<h2>Войти на сервер</h2><p class="mute">Локальные данные и ожидающие операции остаются на телефоне.</p>
+      <label>PIN</label><input id="reauth_pin" type="password" inputmode="numeric" autocomplete="off">
+      <div class="stack" style="margin-top:12px"><button class="btn primary block" data-act="reauthsubmit">Войти</button><button class="btn block" data-act="closem">Отмена</button></div>`);
+    case "reauthsubmit": return run(async () => {
+      const login = await api("login", { pin: $("#reauth_pin").value });
+      await Offline.rememberAuthentication(true, login.token);
+      S.reauthRequired = false;
+      closeModal();
+      await probeServer();
+      render();
     });
     case "connectserver": return run(async () => {
       const address = validateServerAddress($("#server_url").value);
@@ -720,7 +813,7 @@ document.addEventListener("click", (e) => {
       toast(C.pending ? "Списание сохранено на телефоне; ожидает синхронизации" : "Подарок списан");
     });
     case "undo": return run(async () => {
-      if (!navigator.onLine || S.offline) throw new Error("Отмена доступна после подключения к серверу.");
+      if (S.sync !== "ONLINE") throw new Error("Отмена доступна после подключения к серверу.");
       return undoModal((await api("ops/" + d.id + "/undo", {})).preview);
     });
     case "undook": return run(async () => {
@@ -739,24 +832,51 @@ document.addEventListener("click", (e) => {
     case "savepin": return run(async () => { await api("settings", { current_pin: $("#p_cur").value, new_pin: $("#p_new").value }); toast("PIN изменён"); await viewSettings(); });
     case "backup": return run(async () => { const j = await api("backup", {}); toast("Копия создана: " + j.name); await viewSettings(); });
     case "syncnow": return run(async () => {
-      if (!navigator.onLine) throw new Error("Нет подключения к серверу. Ожидающие операции сохранены.");
-      await Offline.synchronize(api);
-      S.offline = false; S.syncError = null;
-      await updateOfflineStatus(); toast(S.pendingCount ? `Осталось синхронизировать: ${S.pendingCount}` : "Синхронизация завершена");
-      await render();
+      S.sync = "SYNCING";
+      refreshSyncNotice();
+      try {
+        await Offline.synchronize(api);
+        await finishSyncState();
+        await updateOfflineStatus();
+        refreshSyncNotice();
+        toast(S.pendingCount ? `Осталось синхронизировать: ${S.pendingCount}` : "Синхронизация завершена");
+      } catch (error) {
+        await failSyncState(error);
+        refreshSyncNotice();
+        throw error;
+      }
     });
     case "exportpending": return run(async () => { await Offline.exportPending(); toast("Экспорт ожидающих операций создан"); });
   }
 });
 
 let retryDelay = 1000, retryTimer = null;
+async function finishSyncState() {
+  S.syncError = "";
+  S.reauthRequired = false;
+  await updateOfflineStatus();
+  S.sync = S.pendingError && (await Offline.pending()).some((entry) => entry.last_error && entry.last_error.conflict)
+    ? "CONFLICT" : (S.pendingCount ? "PENDING" : "ONLINE");
+  S.offline = S.sync !== "ONLINE";
+  refreshSyncNotice();
+}
+async function failSyncState(error) {
+  S.syncError = error.message;
+  S.reauthRequired = !!error.auth;
+  await updateOfflineStatus();
+  const entries = await Offline.pending();
+  S.sync = entries.some((entry) => entry.last_error && entry.last_error.conflict) ? "CONFLICT"
+    : (error.auth ? "SYNC_ERROR" : (error.net ? "LOCAL_ONLY" : "SYNC_ERROR"));
+  S.offline = S.sync !== "ONLINE";
+  refreshSyncNotice();
+}
 async function retrySynchronization() {
-  if (!S.role || !navigator.onLine) return;
+  if (!S.role || S.reauthRequired) return;
   try {
+    S.sync = "SYNCING";
     await Offline.synchronize(api);
     retryDelay = 1000;
-    S.offline = false;
-    S.syncError = null;
+    await finishSyncState();
     await updateOfflineStatus();
     const r = route();
     if (r[0] === "c" && r[1]) {
@@ -764,12 +884,13 @@ async function retrySynchronization() {
       if (C) paintCustomer();
     } else if (r[0] === "settings") {
       await viewSettings();
+    } else {
+      refreshSyncNotice();
     }
   } catch (e) {
-    S.offline = true;
-    S.syncError = e.message;
-    await updateOfflineStatus().catch(() => 0);
-    if (!retryTimer && S.role) {
+    await failSyncState(e);
+    refreshSyncNotice();
+    if (e.net && !retryTimer && S.role) {
       retryTimer = setTimeout(() => {
         retryTimer = null;
         retryDelay = Math.min(retryDelay * 2, 300000);
@@ -778,11 +899,11 @@ async function retrySynchronization() {
     }
   }
 }
-window.addEventListener("online", retrySynchronization);
-window.addEventListener("offline", () => { S.offline = true; render(); });
+window.addEventListener("online", () => { if (S.server_url) retrySynchronization(); });
+window.addEventListener("offline", () => { S.sync = "LOCAL_ONLY"; S.offline = true; render(); });
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) retrySynchronization();
+  if (!document.hidden && S.server_url) retrySynchronization();
 });
-setInterval(() => { if (navigator.onLine) retrySynchronization(); }, 30000);
+setInterval(() => { if (S.server_url && S.role) retrySynchronization(); }, 30000);
 
 boot();

@@ -1,1 +1,14 @@
-__pycache__/*
+__pycache__/
+*.py[cod]
+
+# Runtime data and private credentials must never be published.
+data/
+settings.json
+PIVO_FAULT_*
+
+# Local environment and editor files.
+.venv/
+venv/
+.env
+.DS_Store
+Thumbs.db

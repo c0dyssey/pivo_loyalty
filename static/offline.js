@@ -3,9 +3,25 @@
 (() => {
   const DB_NAME = "pivo-offline";
   const DB_VERSION = 1;
+  const CORE_STORES = ["customers", "products", "operations", "outbox", "sync_metadata"];
+  const READY_MARKER = "pivo-idb-ready";
   const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let dbPromise;
   let syncPromise = null;
+  let storageError = null;
+
+  const marker = () => {
+    try { return localStorage.getItem(READY_MARKER); }
+    catch (error) {
+      storageError = new Error("Не удалось проверить сохранность локальной базы. Разрешите хранилище сайта и перезапустите приложение.");
+      throw storageError;
+    }
+  };
+  const failStorage = (message) => {
+    storageError = new Error(message);
+    window.dispatchEvent(new CustomEvent("pivo-storage-error", { detail: storageError.message }));
+    return storageError;
+  };
 
   const uuid = () => {
     if (crypto.randomUUID) return crypto.randomUUID();
@@ -22,22 +38,61 @@
     return Math.round(value * 2);
   };
   const open = () => {
+    if (storageError) return Promise.reject(storageError);
     if (!("indexedDB" in window)) return Promise.reject(new Error("Это браузер не поддерживает локальное хранилище IndexedDB."));
-    if (!dbPromise) dbPromise = new Promise((resolve, reject) => {
+    if (!dbPromise) {
+      const hadReadyMarker = !!marker();
+      dbPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
+      let blocked = false;
       request.onupgradeneeded = () => {
         const db = request.result;
+        if (hadReadyMarker && request.oldVersion === 0) {
+          failStorage("Локальная база клиентов и ожидающих операций отсутствует, хотя ранее приложение уже сохраняло данные. Не продолжайте работу с пустой базой. Проверьте другой браузер/адрес сайта или восстановите данные с ноутбука.");
+          request.transaction.abort();
+          return;
+        }
+        if (hadReadyMarker && CORE_STORES.some((name) => !db.objectStoreNames.contains(name))) {
+          failStorage("Структура локальной базы несовместима с этой версией приложения. Данные не изменены; не очищайте данные сайта.");
+          request.transaction.abort();
+          return;
+        }
         if (!db.objectStoreNames.contains("customers")) db.createObjectStore("customers", { keyPath: "id" });
         if (!db.objectStoreNames.contains("products")) db.createObjectStore("products", { keyPath: "key" });
         if (!db.objectStoreNames.contains("operations")) db.createObjectStore("operations", { keyPath: "operation_id" });
         if (!db.objectStoreNames.contains("outbox")) db.createObjectStore("outbox", { keyPath: "operation_id" });
         if (!db.objectStoreNames.contains("sync_metadata")) db.createObjectStore("sync_metadata", { keyPath: "key" });
       };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("Не удалось открыть IndexedDB."));
-      request.onblocked = () => reject(new Error("Локальная база занята другой вкладкой. Закройте лишние вкладки и повторите."));
-    });
+      request.onsuccess = () => {
+        const db = request.result;
+        if (blocked || CORE_STORES.some((name) => !db.objectStoreNames.contains(name))) {
+          db.close();
+          dbPromise = null;
+          reject(failStorage("Не удалось безопасно открыть локальную базу. Закройте другие вкладки и не продолжайте операции."));
+          return;
+        }
+        db.onversionchange = () => {
+          db.close();
+          failStorage("Локальная база обновляется в другой вкладке. Закройте все вкладки приложения и перезапустите его.");
+        };
+        resolve(db);
+      };
+      request.onerror = () => {
+        dbPromise = null;
+        reject(storageError || failStorage("Не удалось открыть локальную базу. Сохранённые данные не сброшены."));
+      };
+      request.onblocked = () => {
+        blocked = true;
+        dbPromise = null;
+        reject(failStorage("Локальная база занята другой вкладкой. Закройте остальные вкладки приложения и перезапустите."));
+      };
+      });
+    }
     return dbPromise;
+  };
+  const markReady = () => {
+    try { localStorage.setItem(READY_MARKER, String(DB_VERSION)); }
+    catch (error) { throw failStorage("Не удалось установить защитную отметку локального хранилища. Освободите место и перезапустите приложение."); }
   };
   const quotaMessage = (error) => {
     if (error && (error.name === "QuotaExceededError" || error.name === "NS_ERROR_DOM_QUOTA_REACHED")) {
@@ -67,7 +122,10 @@
     await new Promise((resolve, reject) => {
       const tx = db.transaction("sync_metadata", "readwrite");
       tx.objectStore("sync_metadata").put({ key, value });
-      tx.oncomplete = resolve;
+      tx.oncomplete = () => {
+        try { markReady(); resolve(); }
+        catch (error) { reject(error); }
+      };
       tx.onabort = tx.onerror = () => reject(quotaMessage(tx.error));
     });
   };
@@ -84,7 +142,12 @@
   const stores = (names, mode, prepare) => open().then((db) => new Promise((resolve, reject) => {
     const tx = db.transaction(names, mode);
     let value, callbackError;
-    tx.oncomplete = () => resolve(value);
+    tx.oncomplete = () => {
+      try {
+        if (mode === "readwrite") markReady();
+        resolve(value);
+      } catch (error) { reject(error); }
+    };
     tx.onabort = tx.onerror = () => reject(quotaMessage(callbackError || tx.error));
     try {
       prepare(tx, (result) => { value = result; }, (error) => {
@@ -227,7 +290,12 @@
         store.put({ key: "sync_lease", value: { owner, expires_at: Date.now() + 120000 } });
       };
       req.onerror = () => { try { tx.abort(); } catch (_) {} };
-      tx.oncomplete = () => resolve(acquired ? owner : null);
+      tx.oncomplete = () => {
+        try {
+          if (acquired) markReady();
+          resolve(acquired ? owner : null);
+        } catch (error) { reject(error); }
+      };
       tx.onabort = tx.onerror = () => reject(tx.error || new Error("Не удалось получить блокировку синхронизации."));
     });
   };
@@ -287,17 +355,23 @@
     });
   const getAuthToken = () => getMeta("auth_token", "");
   const setAuthToken = (value) => setMeta("auth_token", value || "");
+  const clearAuthToken = () => setAuthToken("");
   const bootstrap = async () => {
     await open();
     const config = await productConfig();
-    const authenticated = await getMeta("authenticated", false);
+    const authenticated = await getMeta("local_session", await getMeta("authenticated", false));
     const record = await getMeta("device_id", null);
+    const customers = await readAll("customers");
+    const outbox = await readAll("outbox");
+    if (authenticated && (config || customers.length || outbox.length)) markReady();
     return {
       authenticated: !!authenticated,
       device_id: record,
+      server_url: await serverUrl(),
       cursor: await getMeta("cursor", 0),
       config,
-      pending: (await readAll("outbox")).length,
+      pending: outbox.length,
+      customers: customers.length,
     };
   };
   const cacheProducts = (state) => stores(["products"], "readwrite", (tx) => {
@@ -347,6 +421,12 @@
       const ready = () => {
         if (--remaining) return;
         try {
+          const prior = ops.find((row) => row.operation_id === operationId);
+          if (prior) {
+            const existing = (customerReq.result || []).find((row) => row.id === prior.operation.customer_id);
+            result = { operation: prior.operation, customer: existing ? existing.current : null, existing: true };
+            return;
+          }
           if (type !== "register" && !customer) throw new Error("Клиент не сохранён на этом телефоне. Подключитесь к серверу и повторите.");
           if (type === "register") {
             const phone = String(payload.phone || "").replace(/\D/g, "");
@@ -375,11 +455,6 @@
             base_version: cursor,
           };
           const entry = { operation_id: operation.operation_id, operation, status: "pending", server_operation_ids: [] };
-          const prior = ops.find((row) => row.operation_id === operation.operation_id);
-          if (prior) {
-            result = { operation: prior.operation, customer: customer ? customer.current : null, existing: true };
-            return;
-          }
           const beforeEarned = customer.current.gifts_earned || 0;
           if (type === "purchase") {
             const total = payload.items.reduce((sum, item) => {
@@ -407,7 +482,10 @@
       seqReq.onerror = () => fail(seqReq.error);
       cursorReq.onsuccess = () => { cursor = cursorReq.result ? cursorReq.result.value : 0; ready(); };
       cursorReq.onerror = () => fail(cursorReq.error);
-      tx.oncomplete = () => resolve(result);
+      tx.oncomplete = () => {
+        try { markReady(); resolve(result); }
+        catch (error) { reject(error); }
+      };
       tx.onabort = tx.onerror = () => reject(quotaMessage(tx.error));
     });
   };
@@ -423,7 +501,8 @@
     const matches = rows.map((row) => row.current).filter((customer) => {
       if (!q) return true;
       if (numeric) return digits.length >= 3 && customer.phone.includes(digits);
-      return `${customer.name} ${customer.surname}`.trim().toLowerCase().includes(q);
+      const name = `${customer.name} ${customer.surname}`.trim().toLowerCase();
+      return q.split(/\s+/).every((part) => name.includes(part));
     }).sort((a, b) => (b.last_visit || b.created || "").localeCompare(a.last_visit || a.created || ""));
     return { results: matches.slice(0, 20).map((c) => ({
       id: c.id, name: c.name, surname: c.surname, phone_fmt: c.phone_fmt, gifts_avail: c.gifts_avail,
@@ -441,13 +520,20 @@
     setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   };
 
-  const acknowledge = async (results) => stores(["outbox", "operations"], "readwrite", (tx) => {
+  const acknowledge = async (results) => stores(["outbox", "operations", "sync_metadata"], "readwrite", (tx) => {
     const outbox = tx.objectStore("outbox");
     const operations = tx.objectStore("operations");
+    const metadata = tx.objectStore("sync_metadata");
     for (const result of results) {
       if (!result.operation_id) continue;
       if (result.acknowledged) {
         outbox.delete(result.operation_id);
+        const requestMeta = metadata.getAll();
+        requestMeta.onsuccess = () => {
+          for (const item of requestMeta.result) {
+            if (item.key.startsWith("request:") && item.value === result.operation_id) metadata.delete(item.key);
+          }
+        };
         const req = operations.get(result.operation_id);
         req.onsuccess = () => {
           const entry = req.result;
@@ -483,13 +569,19 @@
       const outboxStore = tx.objectStore("outbox");
       const rowsRequest = customerStore.getAll();
       const opsRequest = operationsStore.getAll();
+      const configRequest = tx.objectStore("products").get("config");
       const customers = changes.customers || [];
       const processed = new Set(changes.processed_operation_ids || []);
-      const config = changes.products;
-      let remaining = 2;
-      let rows, localOps;
+      let config = changes.products;
+      let remaining = 3;
+      let rows, localOps, cachedConfig;
       const finish = () => {
         if (--remaining) return;
+        if (!config) config = cachedConfig;
+        if (!config && (localOps || []).some((entry) => !processed.has(entry.operation_id))) {
+          fail(new Error("Локальная конфигурация товаров отсутствует; ожидающие операции сохранены и не применены."));
+          return;
+        }
         const localById = new Map((rows || []).map((row) => [row.id, row]));
         const serverCustomerIds = new Set(customers.map((customer) => customer.id));
         for (const customer of customers) {
@@ -507,7 +599,16 @@
           } else if (row && entry.status !== "acknowledged") {
             try {
               row.current = reduceOperation(row.current, entry, config ? config.drinks : []);
-            } catch (e) { fail(e); }
+            } catch (e) {
+              const outboxRequest = outboxStore.get(entry.operation_id);
+              outboxRequest.onsuccess = () => {
+                if (!outboxRequest.result) return;
+                outboxRequest.result.last_error = { message: e.message, conflict: true, code: "local_projection_conflict" };
+                outboxStore.put(outboxRequest.result);
+                entry.last_error = outboxRequest.result.last_error;
+                operationsStore.put(entry);
+              };
+            }
           }
         }
         for (const row of localById.values()) customerStore.put(row);
@@ -518,11 +619,12 @@
       rowsRequest.onerror = () => { try { tx.abort(); } catch (_) {} };
       opsRequest.onsuccess = () => { localOps = opsRequest.result; finish(); };
       opsRequest.onerror = () => { try { tx.abort(); } catch (_) {} };
+      configRequest.onsuccess = () => { cachedConfig = configRequest.result && configRequest.result.value; finish(); };
+      configRequest.onerror = () => { try { tx.abort(); } catch (_) {} };
     });
   };
   const synchronize = async (send) => {
     if (syncPromise) return syncPromise;
-    if (!navigator.onLine) return { synchronized: false, reason: "offline" };
     syncPromise = (async () => {
       const owner = await acquireLease();
       if (!owner) return { synchronized: false, reason: "busy" };
@@ -578,9 +680,10 @@
     exportPending,
     synchronize,
     rememberAuthentication: async (value, token) => {
-      await setMeta("authenticated", !!value);
+      await setMeta("local_session", !!value);
       await setAuthToken(value ? token : "");
     },
+    clearAuthToken,
     serverUrl,
     setServerUrl,
     getAuthToken,
@@ -588,5 +691,6 @@
     clearRequestIdForKey,
     persistentStorage,
     requestOperationId,
+    get storageError() { return storageError; },
   };
 })();
