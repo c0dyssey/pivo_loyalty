@@ -509,7 +509,6 @@
     })), recent: !q };
   };
   const pending = () => readAll("outbox");
-  const outboxCount = async () => (await pending()).length;
   const exportPending = async () => {
     const entries = await pending();
     const blob = new Blob([JSON.stringify(entries.map((entry) => entry.operation), null, 2)], { type: "application/json" });
@@ -664,8 +663,6 @@
       try { await navigator.storage.persist(); } catch (_) { /* browser can deny persistent storage */ }
     }
   };
-  const requestOperationId = () => uuid();
-
   window.Offline = {
     open,
     bootstrap,
@@ -676,7 +673,6 @@
     getCustomer,
     search,
     pending,
-    outboxCount,
     exportPending,
     synchronize,
     rememberAuthentication: async (value, token) => {
@@ -690,7 +686,6 @@
     requestIdForKey,
     clearRequestIdForKey,
     persistentStorage,
-    requestOperationId,
     get storageError() { return storageError; },
   };
 })();

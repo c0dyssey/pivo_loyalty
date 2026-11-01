@@ -97,7 +97,7 @@ class Env:
         os.makedirs(self.data)
         shutil.copytree(cert_cache(), os.path.join(self.data, "cert"))
         self.settings = os.path.join(self.root, "settings.json")
-        shutil.copy(os.path.join(HERE, "settings.json"), self.settings)
+        shutil.copy(os.path.join(HERE, "settings.example.json"), self.settings)
         self.fault = os.path.join(self.root, "fault.json")
         self.port = 19100 + (os.getpid() % 500) * 5 + Env.n % 5 + Env.n * 7 % 3000 // 3
         self.proc = None
