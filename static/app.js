@@ -8,7 +8,7 @@ const fdt = (ts) => { const d = new Date(ts); return d.toLocaleDateString("ru-RU
 const fd = (ts) => (ts ? new Date(ts).toLocaleDateString("ru-RU") : "—");
 
 let S = {
-  role: null, drinks: [], shop: "", setup_needed: false, local: false, tls_port: 0,
+  role: null, drinks: [], shop: "", loyalty: { paid_liters: 6, reward_liters: 1 }, setup_needed: false, local: false, tls_port: 0,
   offline: true, sync: "LOCAL_ONLY", syncError: "", storageError: "", reauthRequired: false,
 };
 let C = null;          // открытая карточка клиента
@@ -196,6 +196,7 @@ async function boot() {
       S.role = "staff";
       S.shop = cached.config.shop;
       S.drinks = cached.config.drinks.filter((drink) => drink.active !== false);
+      S.loyalty = cached.config.loyalty || { paid_liters: 6, reward_liters: 1 };
       S.sync = "LOCAL_ONLY";
       S.offline = true;
       await updateOfflineStatus();
@@ -335,7 +336,7 @@ async function viewLocked() {
 
 // ---------- настройка / вход
 function viewSetup() {
-  if (!S.local) return `<div class="card center"><h2>Нужна первая настройка</h2><p>Откройте этот сайт на самом компьютере по адресу <b>https://localhost:8443</b> и задайте PIN.</p></div>`;
+  if (!S.local) return `<div class="card center"><h2>Нужна первая настройка</h2><p>Откройте этот сайт на самом компьютере по адресу <b>https://localhost:${S.tls_port || 8443}</b> и задайте PIN.</p></div>`;
   return `<div class="top"><div class="t">Первая настройка</div></div>
   <div class="card"><label>Придумайте PIN для входа (4–12 цифр, лучше 6)</label><input id="s_pin" inputmode="numeric" autocomplete="off">
   <p class="mute">PIN нужен продавцу для входа на телефоне. Забыли PIN: удалите файл data/config.json и откройте сайт на ПК — клиенты сохранятся.</p>
@@ -459,9 +460,11 @@ function tile(d, per, qty) {
     ${qty ? `<span class="qty">+${fl(qty / 2)}</span>` : ""}${p.gift_used > 0 ? `<span class="gf">🎁 ${fl(p.gift_used)}</span>` : ""}</button>`;
 }
 function progressCard(c) {
-  return `<div class="card"><div class="row"><b class="grow">До подарка</b><span>${fl(c.progress)} из 6</span></div>
-    <span class="meter" style="display:block;margin-top:8px"><i style="width:${Math.min(100, (c.progress / 6) * 100)}%;background:var(--green)"></i></span>
-    <div class="mute" style="margin-top:6px">6 л любого пива = 1 л любого в подарок</div></div>`;
+  const paid = Number(S.loyalty.paid_liters) || 6;
+  const reward = Number(S.loyalty.reward_liters) || 1;
+  return `<div class="card"><div class="row"><b class="grow">До подарка</b><span>${fl(c.progress)} из ${fl(paid)}</span></div>
+    <span class="meter" style="display:block;margin-top:8px"><i style="width:${Math.min(100, (c.progress / paid) * 100)}%;background:var(--green)"></i></span>
+    <div class="mute" style="margin-top:6px">${fl(paid)} любого пива = ${fl(reward)} любого в подарок</div></div>`;
 }
 function paintCustomer() {
   const c = C, per = Object.fromEntries(c.per_drink.map((p) => [p.drink, p]));
@@ -495,10 +498,13 @@ function cartBar() {
   const ids = Object.keys(cart).filter((k) => cart[k] > 0);
   if (!ids.length) return "";
   const dm = Object.fromEntries(S.drinks.map((d) => [d.id, d]));
-  const add = ids.reduce((a, k) => a + cart[k], 0), paid = C.total_paid * 2, gain = Math.floor((paid + add) / 12) - Math.floor(paid / 12);
+  const add = ids.reduce((a, k) => a + cart[k], 0), paid = C.total_paid * 2;
+  const cycleHalf = (Number(S.loyalty.paid_liters) || 6) * 2;
+  const reward = Number(S.loyalty.reward_liters) || 1;
+  const gain = (Math.floor((paid + add) / cycleHalf) - Math.floor(paid / cycleHalf)) * reward;
   const lines = ids.map((id) => `<div class="row" style="margin-bottom:4px"><div class="grow"><b>${esc(dm[id].emoji)} ${esc(dm[id].name)}</b> +${fl(cart[id] / 2)}</div>
     <button class="iconbtn" style="height:36px;min-width:36px" data-act="rmline" data-d="${esc(id)}">✕</button></div>`).join("");
-  const tot = `<div class="mute" style="margin-bottom:6px">Всего +${fl(add / 2)} · ${gain ? `<span class="badge">🎁 +${gain} л в подарок</span>` : `будет ${fl(((paid + add) % 12) / 2)} из 6`}</div>`;
+  const tot = `<div class="mute" style="margin-bottom:6px">Всего +${fl(add / 2)} · ${gain ? `<span class="badge">🎁 +${fl(gain)} в подарок</span>` : `будет ${fl(((paid + add) % cycleHalf) / 2)} из ${fl(cycleHalf / 2)}`}</div>`;
   return `<div class="sticky"><div class="in"><div class="cartlines">${lines}</div>${tot}<button class="btn primary block" style="margin-top:6px" data-act="buy">✓ Подтвердить покупку</button></div></div>`;
 }
 
@@ -620,13 +626,19 @@ async function viewSettings() {
       <button class="btn primary block" style="margin-top:10px" data-act="syncnow">Синхронизировать сейчас</button>
       <button class="btn block" style="margin-top:8px" data-act="exportpending">Экспортировать ожидающие операции</button></div>
       ${S.reauthRequired ? `<div class="card"><b>Требуется вход на сервер</b><p class="mute">Локальная сессия и ожидающие операции сохранены.</p><button class="btn primary block" data-act="reauth">Войти на сервер</button></div>` : ""}
-      <div class="card mute">PIN и серверные настройки доступны при подключении к компьютеру магазина.</div>`;
+      <div class="card mute">Управление сервером, PIN и настройками магазина доступно на ноутбуке: откройте на нём https://localhost:${S.tls_port || 8443}.</div>`;
     return;
   }
   $("#app").innerHTML = `${hdr("Настройки", true)}
   ${offlineNotice()}
-  <div class="card"><b>Напитки и название магазина</b>
-  <p class="mute">Список редактируется в файле <b>settings.json</b> (в папке программы) обычным Блокнотом: добавьте строку напитка, сохраните файл и обновите страницу. Название, эмодзи и цвет плитки задаются там же.</p>
+  <div class="card"><b>Конфигурация магазина</b>
+  <p class="mute">Для изменения названия, напитков, PIN, синхронизации или резервных копий откройте панель управления
+  на ноутбуке: <b>https://localhost:${S.tls_port || 8443}</b>. Эта страница телефона только показывает настройки.</p>
+  <div class="mute">Файл: ${esc(j.settings_file)}<br>Награда: ${fl(j.loyalty.paid_liters)} оплаченных л → ${fl(j.loyalty.reward_liters)} бесплатно<br>
+  HTTPS-порт: ${j.server.https_port}<br>Pages origins: ${esc(j.server.pages_origins.join(", ") || "нет")}<br>
+  Резервная копия: каждые ${j.backup_policy.interval_hours} ч., хранить ${j.backup_policy.retention_days} дней</div>
+  <p class="mute">Сохраните settings.json после правки. Изменения магазина, напитков и правила применяются автоматически;
+  сетевые настройки и расписание резервирования — после перезапуска сервера.</p>
   ${j.settings_error ? `<div class="warn">⚠ Ошибка в файле: ${esc(j.settings_error)}<br>Пока она не исправлена, действует прежний список.</div>` : ""}
   <div class="chips">${j.drinks.map((d) => `<span class="chip ${d.active ? "" : "mute"}" style="${d.active ? "" : "opacity:.5"}">${esc(d.emoji)} ${esc(d.name)}${d.active ? "" : " (скрыт)"}</span>`).join("")}</div></div>
   <div class="card"><b>Сменить PIN</b><label>Текущий PIN</label><input id="p_cur" type="password" inputmode="numeric" autocomplete="off">
@@ -894,6 +906,12 @@ function scheduleSynchronizationRetry() {
 async function finishSyncState() {
   S.syncError = "";
   S.reauthRequired = false;
+  const cached = await Offline.bootstrap();
+  if (cached.config) {
+    S.shop = cached.config.shop;
+    S.drinks = cached.config.drinks.filter((drink) => drink.active !== false);
+    S.loyalty = cached.config.loyalty || { paid_liters: 6, reward_liters: 1 };
+  }
   await updateOfflineStatus();
   S.sync = S.pendingError && (await Offline.pending()).some((entry) => entry.last_error && entry.last_error.conflict)
     ? "CONFLICT" : (S.pendingCount ? "PENDING" : "ONLINE");

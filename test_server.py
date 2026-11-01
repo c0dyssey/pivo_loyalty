@@ -16,9 +16,16 @@ TMP = ENV.root
 SETTINGS = ENV.settings
 
 
-def write_settings(drinks, shop="Тест"):
+def write_settings(drinks, shop="Тест", loyalty=None, server=None, backups=None):
+    settings = {"shop": shop, "drinks": drinks}
+    if loyalty is not None:
+        settings["loyalty"] = loyalty
+    if server is not None:
+        settings["server"] = server
+    if backups is not None:
+        settings["backups"] = backups
     with open(SETTINGS, "w", encoding="utf-8") as f:
-        json.dump({"shop": shop, "drinks": drinks}, f, ensure_ascii=False)
+        json.dump(settings, f, ensure_ascii=False)
     os.utime(SETTINGS, (time.time() + write_settings.n, time.time() + write_settings.n))
     write_settings.n += 2
 
@@ -50,6 +57,13 @@ def main():
     p = start()
     try:
         a = Client()
+        st, root_html = a.call("GET", "/", raw=True)
+        check(st == 200 and b"admin.js" in root_html and b"admin.css" in root_html,
+              "localhost открывает отдельную панель управления")
+        st, admin_status = a.call("GET", "/api/admin/status")
+        check(st == 200 and admin_status["setup_needed"] and not admin_status["authenticated"] and
+              admin_status["settings"] is None and admin_status["runtime"] is None,
+              "до входа панель не раскрывает серверные настройки")
         st, j = a.call("GET", "/api/state")
         check(j["setup_needed"] and j["shop"] == "Тест", "первый запуск: нужна настройка, название из settings.json")
         st, j = a.call("POST", "/api/setup", {"pin": "1111"})
@@ -64,6 +78,26 @@ def main():
         check(st == 401, "без входа API закрыт")
         st, j = s.call("POST", "/api/login", {"pin": "48291"})
         check(st == 200 and j.get("role") == "staff", "вход по PIN (один аккаунт)")
+        st, admin_status = s.call("GET", "/api/admin/status")
+        check(st == 200 and admin_status["authenticated"] and admin_status["settings"]["shop"] == "Тест",
+              "панель показывает настройки после входа")
+        dashboard_config = {
+            "shop": "Панель тест",
+            "drinks": DRINKS,
+            "loyalty": {"paid_liters": 4, "reward_liters": 0.5},
+            "server": {"https_port": 8443, "pages_origins": ["https://c0dyssey.github.io"]},
+            "backups": {"interval_hours": 2, "retention_days": 14},
+        }
+        st, saved = s.call("POST", "/api/admin/settings", {"settings": dashboard_config})
+        check(st == 200 and saved["ok"] and saved["restart_required"],
+              "панель сохраняет JSON и отмечает параметры, требующие перезапуска")
+        with open(SETTINGS, encoding="utf-8") as file:
+            persisted_config = json.load(file)
+        check(persisted_config["shop"] == "Панель тест" and persisted_config["loyalty"]["paid_liters"] == 4,
+              "настройки панели надёжно сохранены в settings.json")
+        st, _ = s.call("POST", "/api/admin/settings", {"settings": {"shop": "", "drinks": []}})
+        check(st == 400, "панель отклоняет неверную конфигурацию")
+        write_settings(DRINKS)
         token = j.get("token", "")
         st, cross_origin_state = s.call("GET", "/api/state", headers={
             "Authorization": "Bearer " + token, "Cookie": "", "Origin": "https://c0dyssey.github.io",
@@ -89,6 +123,19 @@ def main():
         st, j = s.call("GET", "/api/state")
         names = [d["name"] for d in j["drinks"]]
         check(len(names) == 6 and "Князь Сангушко" in names and "Білий келих" in names, "6 напитков из файла, строка-название тоже работает")
+        check(j["loyalty"] == {"paid_liters": 6, "reward_liters": 1},
+              "state возвращает правило лояльности из JSON")
+        write_settings(
+            DRINKS,
+            loyalty={"paid_liters": 4, "reward_liters": 0.5},
+            server={"https_port": 8443, "pages_origins": ["https://c0dyssey.github.io"]},
+            backups={"interval_hours": 2, "retention_days": 14},
+        )
+        st, j = s.call("GET", "/api/settings")
+        check(st == 200 and j["loyalty"] == {"paid_liters": 4, "reward_liters": 0.5} and
+              j["backup_policy"] == {"interval_hours": 2, "retention_days": 14},
+              "settings API показывает правило награды и параметры резервирования из JSON")
+        write_settings(DRINKS)
         d = {x["name"]: x for x in j["drinks"]}
         check(d["Вайсбург Лагер"]["color"].startswith("#") and d["Князь Сангушко"]["emoji"] == "🍺" and d["Князь Сангушко"]["id"] == "knyaz-sangushko",
               "авто-id (транслит), эмодзи по умолчанию, цвет из палитры")
@@ -280,6 +327,8 @@ def main():
               "application/manifest+json" in s.last_headers.get("content-type", ""), "PWA manifest отдаётся с корректным MIME-типом и иконками")
         st, body = s.call("GET", "/sw.js", raw=True)
         check(st == 200 and b"APP_SHELL" in body and b"/api/" in body, "service worker кэширует оболочку, но пропускает API")
+        check(b"LOCAL_ADMIN_HOST" in body and b'url.pathname === "/admin.html"' in body,
+              "service worker не подменяет локальную панель кэшированным приложением")
         st, body = s.call("GET", "/offline.js", raw=True)
         check(st == 200 and b"indexedDB.open" in body and b"sync_metadata" in body, "клиентский модуль IndexedDB доступен")
         check(server.is_private_client("192.168.1.15") and server.is_private_client("::1") and
@@ -368,6 +417,20 @@ def main():
               "pull возвращает обновлённого клиента и новый курсор")
         st, _ = s2.call("POST", "/api/sync/register", {"device_id": device_id})
         check(st == 200, "идентификатор устройства сохраняется после перезапуска")
+        write_settings(
+            DRINKS,
+            loyalty={"paid_liters": 4, "reward_liters": 0.5},
+            server={"https_port": 8443, "pages_origins": ["https://c0dyssey.github.io"]},
+            backups={"interval_hours": 1, "retention_days": 30},
+        )
+        st, customer = s2.call("POST", "/api/customers",
+                               {"name": "Rule", "surname": "Test", "phone": "0501112234"})
+        check(st == 200, "тестовый клиент зарегистрирован для проверки JSON-правила")
+        if st == 200:
+            st, earned = s2.call("POST", f"/api/customers/{customer['id']}/purchase",
+                                 {"items": [{"drink": lager, "liters": 4}]})
+            check(st == 200 and earned["customer"]["gifts_avail"] == 0.5,
+                  "сервер рассчитывает количество награды по JSON-настройке")
         bad = Client()
         for _ in range(5):
             st, _ = bad.call("POST", "/api/login", {"pin": "0000"})

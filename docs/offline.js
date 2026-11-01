@@ -180,9 +180,9 @@
       tx.onabort = () => reject(tx.error);
     });
   };
-  const activeDrinks = async () => {
+  const productConfiguration = async () => {
     const config = await productConfig();
-    return config ? config.drinks.filter((drink) => drink.active !== false) : [];
+    return config || null;
   };
   const newCustomerId = async () => {
     let id;
@@ -206,13 +206,16 @@
       per_drink: [], history: [],
     };
   };
-  const reduceOperation = (customer, operation, drinks) => {
+  const reduceOperation = (customer, operation, config) => {
     const current = clone(customer);
     const op = operation.operation;
     if (op.operation_type === "register") {
       current.pending = true;
       return current;
     }
+    const drinks = config.drinks;
+    const cycleHalf = half(config.loyalty.paid_liters);
+    const rewardHalf = half(config.loyalty.reward_liters);
     const items = op.payload.items || [];
     const normalized = [];
     for (const item of items) {
@@ -235,13 +238,13 @@
       }
       const paidHalf = paidHalfBefore + normalized.reduce((n, item) => n + (half(item.liters) || 0), 0);
       current.total_paid = paidHalf / 2;
-      current.gifts_earned = Math.floor(paidHalf / 12);
-      current.progress = (paidHalf % 12) / 2;
+      current.gifts_earned = Math.floor(paidHalf / cycleHalf) * rewardHalf / 2;
+      current.progress = (paidHalf % cycleHalf) / 2;
       current.visits = (current.visits || 0) + 1;
       current.last_visit = op.created_at;
     } else {
       const usedHalf = normalized.reduce((n, item) => n + (half(item.liters) || 0), 0);
-      const availHalf = Math.floor(paidHalfBefore / 12) * 2 - usedHalfBefore;
+      const availHalf = Math.floor(paidHalfBefore / cycleHalf) * rewardHalf - usedHalfBefore;
       if (usedHalf > availHalf) throw new Error(`Можно списать не больше ${(Math.max(0, availHalf) / 2).toString().replace(".", ",")} л`);
       for (let i = 0; i < items.length; i++) {
         const item = normalized[i];
@@ -380,19 +383,24 @@
       value: {
         shop: state.shop,
         drinks: clone(state.all_drinks || state.drinks || []),
+        loyalty: clone(state.loyalty || { paid_liters: 6, reward_liters: 1 }),
         version: state.products_version || "",
       },
     });
   });
   const cacheCustomer = async (customer) => {
-    const drinks = await activeDrinks();
+    const config = await productConfiguration();
+    const operationConfig = config || { drinks: [], loyalty: { paid_liters: 6, reward_liters: 1 } };
+    const drinks = operationConfig.drinks.filter((drink) => drink.active !== false);
     return stores(["customers", "operations"], "readwrite", (tx, setResult, fail) => {
       const getOps = tx.objectStore("operations").getAll();
       getOps.onsuccess = () => {
         const ops = getOps.result.filter((entry) => entry.operation.customer_id === customer.id && entry.status === "pending");
         let current = clone(customer);
         try {
-          for (const entry of ops) current = reduceOperation(current, entry, drinks);
+          for (const entry of ops) current = reduceOperation(current, entry, {
+            drinks, loyalty: operationConfig.loyalty || { paid_liters: 6, reward_liters: 1 },
+          });
           tx.objectStore("customers").put({ id: customer.id, base: clone(customer), current });
           setResult(current);
         } catch (e) { fail(e); }
@@ -403,7 +411,12 @@
   const enqueue = async (type, customerId, payload, operationId) => {
     const db = await open();
     const deviceId = await ensureDeviceId();
-    const drinks = await activeDrinks();
+    const productConfig = await productConfiguration();
+    const drinks = productConfig ? productConfig.drinks.filter((drink) => drink.active !== false) : [];
+    if (type !== "register" && !productConfig) {
+      throw new Error("Локальная конфигурация товаров отсутствует; операция не сохранена.");
+    }
+    const operationConfig = productConfig || { drinks: [], loyalty: { paid_liters: 6, reward_liters: 1 } };
     return new Promise((resolve, reject) => {
       const tx = db.transaction(["customers", "operations", "outbox", "sync_metadata"], "readwrite");
       const customerStore = tx.objectStore("customers");
@@ -464,7 +477,7 @@
             }, 0);
             if (total > 200) throw new Error("Слишком большой объём за раз.");
           }
-          const current = reduceOperation(customer.current, entry, drinks);
+          const current = reduceOperation(customer.current, entry, operationConfig);
           customer.current = current;
           customerStore.put(customer);
           opsStore.put(entry);
@@ -581,6 +594,11 @@
           fail(new Error("Локальная конфигурация товаров отсутствует; ожидающие операции сохранены и не применены."));
           return;
         }
+        if (config) config = {
+          ...config,
+          loyalty: config.loyalty || { paid_liters: 6, reward_liters: 1 },
+          drinks: config.drinks || [],
+        };
         const localById = new Map((rows || []).map((row) => [row.id, row]));
         const serverCustomerIds = new Set(customers.map((customer) => customer.id));
         for (const customer of customers) {
@@ -597,7 +615,7 @@
             outboxStore.delete(entry.operation_id);
           } else if (row && entry.status !== "acknowledged") {
             try {
-              row.current = reduceOperation(row.current, entry, config ? config.drinks : []);
+              row.current = reduceOperation(row.current, entry, config);
             } catch (e) {
               const outboxRequest = outboxStore.get(entry.operation_id);
               outboxRequest.onsuccess = () => {

@@ -1,9 +1,11 @@
 "use strict";
 
-const CACHE = "pivo-shell-v4";
+const CACHE = "pivo-shell-v5";
 const BASE = new URL(".", self.registration.scope);
+const LOCAL_ADMIN_HOST = new Set(["localhost", "127.0.0.1", "::1"]).has(self.location.hostname);
 const APP_SHELL = [
-  "", "index.html", "style.css", "qrdec.js", "offline.js", "app.js",
+  ...(LOCAL_ADMIN_HOST ? [] : [""]),
+  "index.html", "style.css", "qrdec.js", "offline.js", "app.js",
   "manifest.webmanifest", "icon.svg", "icon-180.png", "icon-192.png", "icon-512.png",
 ].map((path) => new URL(path, BASE).href);
 const APP_PATHS = new Set(APP_SHELL.map((path) => new URL(path).pathname));
@@ -49,6 +51,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin ||
       url.pathname.startsWith("/api/") || url.pathname === "/ca.crt") return;
+  if (LOCAL_ADMIN_HOST && (url.pathname === "/" || url.pathname === "/admin.html")) return;
   if (!APP_PATHS.has(url.pathname) && request.mode !== "navigate") return;
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);

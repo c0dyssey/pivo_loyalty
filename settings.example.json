@@ -7,5 +7,19 @@
     { "id": "kronenbourg-blanc", "name": "Кроненбург Бланш", "emoji": "👑", "color": "#0ea5e9" },
     { "id": "heisenberg-dark", "name": "Хайзенберг Дарк", "emoji": "🌑", "color": "#57534e" },
     { "id": "bilyi-kelyh", "name": "Білий келих", "emoji": "🥂", "color": "#16a34a" }
-  ]
+  ],
+  "loyalty": {
+    "paid_liters": 6,
+    "reward_liters": 1
+  },
+  "server": {
+    "https_port": 8443,
+    "pages_origins": [
+      "https://c0dyssey.github.io"
+    ]
+  },
+  "backups": {
+    "interval_hours": 1,
+    "retention_days": 30
+  }
 }

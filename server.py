@@ -2,7 +2,7 @@
 """Программа лояльности для пивного магазина (локальный сервер, только HTTPS).
 
 Только стандартная библиотека Python 3.8+. Запуск: python server.py
-Напитки и название магазина: settings.json (правится вручную)
+Настройки магазина, лояльности, сети и резервирования: settings.json
 Данные: data/data.json (+ data.json.prev), PIN: data/config.json, копии: data/backups/,
 повреждённые файлы: data/corrupt/, сертификат: data/cert/, события: data/events.log
 """
@@ -53,19 +53,20 @@ CORRUPT_DIR = os.path.join(DATA_DIR, "corrupt")
 CERT_DIR = os.path.join(DATA_DIR, "cert")
 EVENT_LOG = os.path.join(DATA_DIR, "events.log")
 
-CYCLE_H = 12            # 6 литров оплаты = 12 половинок литра -> 7-й литр бесплатно
 SESSION_IDLE_SEC = 3 * 3600
-BACKUPS_KEEP = 30
 REQUEST_TTL_DAYS = 30
+CYCLE_H = 12
+REWARD_H = 2
+BACKUPS_KEEP = 30
+BACKUP_INTERVAL_HOURS = 1
 ID_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 RID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 ROLE = "staff"
-PORT = int(os.environ.get("PIVO_PORT", "8443"))      # единственный порт: HTTPS
-ALLOWED_PWA_ORIGINS = {
-    origin.strip().rstrip("/")
-    for origin in os.environ.get("PIVO_ALLOWED_ORIGINS", "https://c0dyssey.github.io").split(",")
-    if origin.strip() and origin.strip() != "*"
-}
+PORT = int(os.environ.get("PIVO_PORT", "8443"))
+PORT_OVERRIDE = "PIVO_PORT" in os.environ
+ALLOWED_PWA_ORIGINS = {"https://c0dyssey.github.io"}
+ORIGINS_OVERRIDE = "PIVO_ALLOWED_ORIGINS" in os.environ
+SERVER_STARTED = False
 
 DISK_MSG = ("Не удалось записать данные на диск (возможно, нет места или нет доступа к файлу). "
             "Операция НЕ выполнена и не сохранена. Освободите место и повторите.")
@@ -81,6 +82,9 @@ DEFAULT_SETTINGS = {
         {"id": "heisenberg-dark", "name": "Хайзенберг Дарк", "emoji": "🌑", "color": "#57534e"},
         {"id": "bilyi-kelyh", "name": "Білий келих", "emoji": "🥂", "color": "#16a34a"},
     ],
+    "loyalty": {"paid_liters": 6, "reward_liters": 1},
+    "server": {"https_port": 8443, "pages_origins": ["https://c0dyssey.github.io"]},
+    "backups": {"interval_hours": 1, "retention_days": 30},
 }
 PALETTE = ["#d97706", "#0ea5e9", "#16a34a", "#dc2626", "#7c3aed", "#0d9488", "#db2777", "#65a30d"]
 
@@ -88,7 +92,12 @@ LOCK = threading.RLock()
 STATE = {"data": None, "conf": None, "locked": None}
 SYNC_CONTEXT = None
 STATUS = {"backup": {"ok": None, "name": None, "error": None, "ts": None}}
-SETTINGS = {"mtime": None, "shop": DEFAULT_SETTINGS["shop"], "drinks": [], "error": None}
+SETTINGS = {
+    "mtime": None, "shop": DEFAULT_SETTINGS["shop"], "drinks": [],
+    "loyalty": dict(DEFAULT_SETTINGS["loyalty"]), "backups": dict(DEFAULT_SETTINGS["backups"]),
+    "server": dict(DEFAULT_SETTINGS["server"]),
+    "error": None,
+}
 SESSIONS = {}       # token -> {"seen":...}
 FAILS = {}          # ip -> {"n":..., "until":...}
 
@@ -439,7 +448,8 @@ def do_backup(force=False, refresh=False):
     need = force or not os.path.exists(path)
     if refresh and not need:
         try:
-            need = os.path.getmtime(DATA_FILE) > os.path.getmtime(path) and time.time() - os.path.getmtime(path) > 3300
+            refresh_after = max(0, BACKUP_INTERVAL_HOURS * 3600 - 300)
+            need = os.path.getmtime(DATA_FILE) > os.path.getmtime(path) and time.time() - os.path.getmtime(path) > refresh_after
         except OSError:
             need = True
     if need:
@@ -465,7 +475,7 @@ def do_backup(force=False, refresh=False):
 
 def backup_loop():
     while True:
-        time.sleep(3600)
+        time.sleep(BACKUP_INTERVAL_HOURS * 3600)
         try:
             with LOCK:
                 do_backup(refresh=True)
@@ -560,6 +570,65 @@ def parse_drinks(raw):
     return out
 
 
+def parse_liter_setting(value, label):
+    if isinstance(value, bool):
+        raise ValueError(f"{label} должен быть числом")
+    amount = half(value)
+    if amount is None or amount <= 0 or amount > 2000:
+        raise ValueError(f"{label} должен быть положительным числом, кратным 0,5 л (не больше 1000 л)")
+    return amount / 2
+
+
+def parse_origin(value):
+    if not isinstance(value, str):
+        raise ValueError("pages_origins должен содержать HTTPS origins")
+    parsed = urlparse(value)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or
+            parsed.path not in ("", "/") or parsed.query or parsed.fragment or value == "*"):
+        raise ValueError(f"недопустимый Pages origin: {value!r}")
+    try:
+        parsed.port
+    except ValueError as error:
+        raise ValueError(f"недопустимый порт в Pages origin: {value!r}") from error
+    return f"https://{parsed.netloc}".rstrip("/")
+
+
+def parse_app_settings(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("файл должен быть объектом { ... }")
+    drinks = parse_drinks(raw.get("drinks", DEFAULT_SETTINGS["drinks"]))
+    loyalty = raw.get("loyalty", DEFAULT_SETTINGS["loyalty"])
+    if not isinstance(loyalty, dict):
+        raise ValueError("loyalty должен быть JSON-объектом")
+    loyalty = {
+        "paid_liters": parse_liter_setting(loyalty.get("paid_liters", 6), "loyalty.paid_liters"),
+        "reward_liters": parse_liter_setting(loyalty.get("reward_liters", 1), "loyalty.reward_liters"),
+    }
+    server = raw.get("server", DEFAULT_SETTINGS["server"])
+    if not isinstance(server, dict):
+        raise ValueError("server должен быть JSON-объектом")
+    port = server.get("https_port", 8443)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("server.https_port должен быть целым числом от 1 до 65535")
+    origins = server.get("pages_origins", DEFAULT_SETTINGS["server"]["pages_origins"])
+    if not isinstance(origins, list):
+        raise ValueError("server.pages_origins должен быть списком HTTPS origins")
+    origins = sorted({parse_origin(origin) for origin in origins})
+    backups = raw.get("backups", DEFAULT_SETTINGS["backups"])
+    if not isinstance(backups, dict):
+        raise ValueError("backups должен быть JSON-объектом")
+    interval = backups.get("interval_hours", 1)
+    retention = backups.get("retention_days", 30)
+    if isinstance(interval, bool) or not isinstance(interval, int) or not 1 <= interval <= 168:
+        raise ValueError("backups.interval_hours должен быть целым числом от 1 до 168")
+    if isinstance(retention, bool) or not isinstance(retention, int) or not 1 <= retention <= 3650:
+        raise ValueError("backups.retention_days должен быть целым числом от 1 до 3650")
+    shop = str(raw.get("shop") or DEFAULT_SETTINGS["shop"]).strip()[:60]
+    return shop, drinks, loyalty, {"https_port": port, "pages_origins": origins}, {
+        "interval_hours": interval, "retention_days": retention,
+    }
+
+
 def refresh_settings(force=False):
     """перечитывает settings.json, если файл изменился"""
     if not os.path.exists(SETTINGS_FILE):
@@ -575,15 +644,34 @@ def refresh_settings(force=False):
     try:
         with open(SETTINGS_FILE, encoding="utf-8-sig") as f:
             raw = json.load(f)
-        if not isinstance(raw, dict):
-            raise ValueError("файл должен быть объектом { ... }")
-        drinks = parse_drinks(raw.get("drinks"))
-        SETTINGS.update(shop=str(raw.get("shop") or DEFAULT_SETTINGS["shop"]).strip()[:60], drinks=drinks, error=None)
+        shop, drinks, loyalty, server, backups = parse_app_settings(raw)
+        SETTINGS.update(shop=shop, drinks=drinks, loyalty=loyalty, backups=backups, server=server, error=None)
+        global CYCLE_H, REWARD_H, BACKUPS_KEEP, BACKUP_INTERVAL_HOURS, PORT, ALLOWED_PWA_ORIGINS
+        CYCLE_H = int(loyalty["paid_liters"] * 2)
+        REWARD_H = int(loyalty["reward_liters"] * 2)
+        BACKUPS_KEEP = backups["retention_days"]
+        BACKUP_INTERVAL_HOURS = backups["interval_hours"]
+        if not SERVER_STARTED:
+            if not PORT_OVERRIDE:
+                PORT = server["https_port"]
+            if ORIGINS_OVERRIDE:
+                ALLOWED_PWA_ORIGINS = {
+                    parse_origin(origin)
+                    for origin in os.environ.get("PIVO_ALLOWED_ORIGINS", "").split(",")
+                    if origin.strip()
+                }
+            else:
+                ALLOWED_PWA_ORIGINS = set(server["pages_origins"])
     except Exception as e:  # noqa
         SETTINGS["error"] = f"settings.json: {e}"
         if not SETTINGS["drinks"]:
             SETTINGS["drinks"] = parse_drinks(DEFAULT_SETTINGS["drinks"])
             SETTINGS["shop"] = DEFAULT_SETTINGS["shop"]
+            SETTINGS["loyalty"] = dict(DEFAULT_SETTINGS["loyalty"])
+            SETTINGS["backups"] = dict(DEFAULT_SETTINGS["backups"])
+            SETTINGS["server"] = dict(DEFAULT_SETTINGS["server"])
+            CYCLE_H, REWARD_H = 12, 2
+            BACKUPS_KEEP, BACKUP_INTERVAL_HOURS = 30, 1
     sync_drinks()
 
 
@@ -639,7 +727,7 @@ def group_ops():
 
 
 def balances(ops):
-    """Общий подарочный счёт: 6 оплаченных литров ЛЮБОГО пива = 1 литр любого пива в подарок.
+    """Общий подарочный счёт по текущим settings.json loyalty rules.
     -> {paid_h, used_h, earned, progress_h, avail_h, per: {напиток: {paid_h, used_h}}}"""
     b = {"paid_h": 0, "used_h": 0, "per": {}}
     for o in ops:
@@ -654,7 +742,7 @@ def balances(ops):
             b["per"].setdefault(o["drink"], {"paid_h": 0, "used_h": 0})["used_h"] += h
     b["earned"] = b["paid_h"] // CYCLE_H
     b["progress_h"] = b["paid_h"] % CYCLE_H
-    b["avail_h"] = b["earned"] * 2 - b["used_h"]
+    b["avail_h"] = b["earned"] * REWARD_H - b["used_h"]
     return b
 
 
@@ -678,7 +766,7 @@ def customer_view(c, with_history=False, limit=60, ops=None):
         "id": c["id"], "name": c["name"], "surname": c["surname"],
         "phone": c["phone"], "phone_fmt": fmt_phone(c["phone"]), "created": c["created"],
         "total_paid": lit(bal["paid_h"]), "progress": lit(bal["progress_h"]),
-        "gifts_earned": bal["earned"], "gifts_used": lit(bal["used_h"]), "gifts_avail": lit(bal["avail_h"]),
+        "gifts_earned": lit(bal["earned"] * REWARD_H), "gifts_used": lit(bal["used_h"]), "gifts_avail": lit(bal["avail_h"]),
         "visits": len(visits), "last_visit": visits[-1]["ts"] if visits else None,
         "per_drink": per,
     }
@@ -913,7 +1001,11 @@ def sync_pull(since):
     page = [o for o in STATE["data"]["ops"] if o["id"] > cursor][:500]
     new_cursor = page[-1]["id"] if page else cursor
     changed = set(STATE["data"]["customers"])
-    products = {"shop": SETTINGS["shop"], "drinks": [dict(d) for d in STATE["data"]["drinks"]]}
+    products = {
+        "shop": SETTINGS["shop"],
+        "drinks": [dict(d) for d in STATE["data"]["drinks"]],
+        "loyalty": dict(SETTINGS["loyalty"]),
+    }
     products["version"] = hashlib.sha256(json.dumps(products, sort_keys=True, ensure_ascii=False,
                                                      separators=(",", ":")).encode("utf-8")).hexdigest()
     return {
@@ -1377,14 +1469,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send(500, {"error": "Внутренняя ошибка сервера"})
 
     def static(self, path):
+        if path in ("", "/"):
+            path = "/admin.html" if is_local(self.ip()) else "/index.html"
+        if path == "/admin.html" and not is_local(self.ip()):
+            return self.send(404, "Не найдено", "text/plain; charset=utf-8")
         if path == "/ca.crt":                       # открытый сертификат центра (не секретный): для установки на устройства
             try:
                 with open(os.path.join(CERT_DIR, "ca.crt"), "rb") as f:
                     return self.send(200, f.read(), "application/x-x509-ca-cert")
             except OSError:
                 return self.send(404, "Не найдено", "text/plain; charset=utf-8")
-        if path in ("", "/"):
-            path = "/index.html"
         fp = os.path.normpath(os.path.join(STATIC, path.lstrip("/")))
         if not fp.startswith(STATIC + os.sep) or not os.path.isfile(fp):
             return self.send(404, "Не найдено", "text/plain; charset=utf-8")
@@ -1415,6 +1509,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, {
                     "setup_needed": conf is None, "local": is_local(self.ip()), "role": ROLE if s else None,
                     "shop": SETTINGS["shop"], "tls_port": PORT, "locked": STATE["locked"],
+                    "loyalty": dict(SETTINGS["loyalty"]),
                     "warnings": warnings_list() if s else [],
                     "drinks": [d for d in STATE["data"]["drinks"] if d["active"]] if s else [],
                     "all_drinks": [dict(d) for d in STATE["data"]["drinks"]] if s else [],
@@ -1473,6 +1568,78 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 return self.send(200, api_restore(str(b.get("name", ""))))
 
+        if ep.startswith("admin/"):
+            if not is_local(self.ip()):
+                raise ApiError("Панель доступна только на ноутбуке (localhost).", 403)
+            if ep == "admin/status" and method == "GET":
+                with LOCK:
+                    authenticated = self.session() is not None
+                    files = backup_names() if authenticated else []
+                    return self.send(200, {
+                        "setup_needed": conf is None,
+                        "authenticated": authenticated,
+                        "shop": SETTINGS["shop"] if authenticated else "",
+                        "settings_file": SETTINGS_FILE if authenticated else "",
+                        "settings_error": SETTINGS["error"] if authenticated else None,
+                        "settings": {
+                            "shop": SETTINGS["shop"],
+                            "drinks": [dict(d) for d in SETTINGS["drinks"]],
+                            "loyalty": dict(SETTINGS["loyalty"]),
+                            "server": dict(SETTINGS["server"]),
+                            "backups": dict(SETTINGS["backups"]),
+                        } if authenticated else None,
+                        "runtime": {
+                            "https_port": PORT,
+                            "port_overridden": PORT_OVERRIDE,
+                            "device_id": STATE["data"].get("sync_device_id"),
+                            "cursor": STATE["data"]["next_op"] - 1,
+                            "backup_count": len(files),
+                            "last_backup": files[-1] if files else None,
+                            "backup_ok": STATUS["backup"]["ok"],
+                            "backup_error": STATUS["backup"]["error"],
+                            "locked": STATE["locked"],
+                        } if authenticated else None,
+                    })
+            if not self.session():
+                raise ApiError("Нужен вход", 401)
+            with LOCK:
+                if STATE["locked"]:
+                    raise ApiError(LOCKED_MSG + " " + STATE["locked"]["reason"], 503, {"locked": STATE["locked"]})
+                if ep == "admin/settings" and method == "POST":
+                    raw = self.read_body().get("settings")
+                    try:
+                        shop, drinks, loyalty, server, backups = parse_app_settings(raw)
+                    except (TypeError, ValueError) as e:
+                        raise ApiError(str(e))
+                    restart_required = SERVER_STARTED and (
+                        server["https_port"] != PORT or server["pages_origins"] != sorted(ALLOWED_PWA_ORIGINS) or
+                        backups != SETTINGS["backups"])
+                    document = {
+                        "shop": shop,
+                        "drinks": [{"id": d["id"], "name": d["name"], "emoji": d["emoji"],
+                                    "color": d["color"], "active": d["active"]} for d in drinks],
+                        "loyalty": loyalty,
+                        "server": server,
+                        "backups": backups,
+                    }
+                    try:
+                        atomic_write(SETTINGS_FILE, document)
+                    except Exception as e:  # noqa
+                        log_event(f"settings.json не записан: {e!r}")
+                        raise ApiError(DISK_MSG, 503)
+                    SETTINGS["mtime"] = None
+                    refresh_settings(force=True)
+                    return self.send(200, {"ok": True, "restart_required": restart_required})
+                if ep == "admin/backup" and method == "POST":
+                    try:
+                        name = do_backup(force=True)
+                    except Exception as e:  # noqa
+                        log_event(f"Ручная копия не создана: {e!r}")
+                        raise ApiError(DISK_MSG, 503)
+                    if not name:
+                        raise ApiError("Копия не прошла проверку и не сохранена: " + (STATUS["backup"]["error"] or ""), 500)
+                    return self.send(200, {"ok": True, "name": name})
+
         if not self.session():
             raise ApiError("Нужен вход", 401)
         parts = ep.split("/")
@@ -1484,7 +1651,8 @@ class Handler(BaseHTTPRequestHandler):
                     "cursor": STATE["data"]["next_op"] - 1,
                     "device_id": STATE["data"].get("sync_device_id"),
                     "products": {"shop": SETTINGS["shop"],
-                                 "drinks": [dict(d) for d in STATE["data"]["drinks"]]},
+                                 "drinks": [dict(d) for d in STATE["data"]["drinks"]],
+                                 "loyalty": dict(SETTINGS["loyalty"])},
                 })
             if ep == "sync/register" and method == "POST":
                 return self.send(200, sync_register_device(self.read_body().get("device_id")))
@@ -1545,6 +1713,9 @@ class Handler(BaseHTTPRequestHandler):
             if ep == "settings" and method == "GET":
                 files = backup_names()
                 return self.send(200, {"shop": SETTINGS["shop"], "settings_file": SETTINGS_FILE, "settings_error": SETTINGS["error"],
+                                       "loyalty": dict(SETTINGS["loyalty"]),
+                                       "server": {"https_port": PORT, "pages_origins": sorted(ALLOWED_PWA_ORIGINS)},
+                                       "backup_policy": dict(SETTINGS["backups"]),
                                        "drinks": [d for d in STATE["data"]["drinks"]], "backups": len(files),
                                        "last_backup": files[-1] if files else None, "backup_ok": STATUS["backup"]["ok"],
                                        "backup_error": STATUS["backup"]["error"], "data_dir": DATA_DIR})
@@ -1586,6 +1757,8 @@ def lan_ip():
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     load_all()
+    global SERVER_STARTED
+    SERVER_STARTED = True
     ip = lan_ip()
     try:
         cert, key = certgen.ensure(CERT_DIR, ["127.0.0.1", ip], ["localhost", socket.gethostname()])

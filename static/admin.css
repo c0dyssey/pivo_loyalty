@@ -1,0 +1,29 @@
+main{max-width:980px;margin:0 auto;padding:16px 20px 60px}
+.admin-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 0}
+.admin-head h1{font-size:25px;margin:0}
+.admin-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.admin-card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:18px}
+.admin-card h2{margin:0 0 8px}
+.admin-card.wide{grid-column:1/-1}
+.admin-card input{height:46px;font-size:17px}
+.admin-card input[type=checkbox]{width:24px;height:24px;vertical-align:middle}
+.admin-card input[type=color]{width:64px;padding:4px}
+.admin-card input[type=number]{max-width:180px}
+.admin-help{color:var(--mute);font-size:14px;margin:6px 0 12px}
+.drink-row{display:grid;grid-template-columns:minmax(120px,1fr) minmax(160px,1.3fr) 68px 90px 78px 44px;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
+.drink-row input{min-width:0}
+.drink-row label{margin:0;font-size:13px}
+.status-line{padding:10px 12px;border-radius:12px;background:var(--greenbg);color:var(--green);font-weight:600}
+.status-line.warn{background:var(--amberbg);color:var(--amber)}
+.admin-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.admin-actions .btn{min-height:44px;font-size:16px}
+.admin-error{color:var(--red);min-height:22px;font-size:14px}
+@media(max-width:700px){
+  main{padding:10px 12px 40px}
+  .admin-grid{grid-template-columns:1fr}
+  .admin-card.wide{grid-column:auto}
+  .drink-row{grid-template-columns:1fr 1fr 64px 76px;gap:6px}
+  .drink-row .drink-color,.drink-row .drink-active{grid-row:2}
+  .drink-row .drink-remove{grid-column:4;grid-row:1}
+  .admin-head h1{font-size:21px}
+}
