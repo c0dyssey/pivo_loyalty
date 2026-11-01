@@ -50,6 +50,9 @@ async function api(path, body, mutation) {
   const token = await Offline.getAuthToken();
   if (token) headers.Authorization = "Bearer " + token;
   const opt = { credentials: "omit", headers };
+  const controller = new AbortController();
+  opt.signal = controller.signal;
+  const timeout = setTimeout(() => controller.abort(), 15000);
   if (body !== undefined) {
     opt.method = "POST";
     opt.headers = Object.assign(headers, { "Content-Type": "application/json", "X-Requested-With": "pivo" });
@@ -60,6 +63,8 @@ async function api(path, body, mutation) {
     const err = new Error(mutation ? "Ответ от сервера не получен. Операция могла записаться: проверьте историю клиента. Повторное нажатие безопасно, дубля не будет."
       : "Нет связи с сервером. Проверьте Wi-Fi, HTTPS-сертификат и адрес сервера в локальной сети.");
     err.net = true; throw err;
+  } finally {
+    clearTimeout(timeout);
   }
   let j = {};
   try { j = await r.json(); } catch (e) { /* не JSON */ }
@@ -110,9 +115,26 @@ async function mut(key, path, body) {
     S.sync = "PENDING";
     S.offline = true;
     await updateOfflineStatus();
-    retrySynchronization();
+    if (type === "register" && S.role && !S.reauthRequired) {
+      S.sync = "SYNCING";
+      refreshSyncNotice();
+      try {
+        await synchronizeOperation(operationId);
+        await finishSyncState();
+      } catch (error) {
+        await failSyncState(error);
+        scheduleSynchronizationRetry();
+      }
+    } else {
+      retrySynchronization();
+    }
+    if (type === "register") {
+      const syncedCustomer = await Offline.getCustomer(queued.operation.customer_id);
+      const stillPending = (await Offline.pending()).some((entry) => entry.operation_id === operationId);
+      if (syncedCustomer) syncedCustomer.pending = stillPending;
+      return syncedCustomer;
+    }
     const syncedCustomer = queued.customer || await Offline.getCustomer(queued.operation.customer_id);
-    if (type === "register") return syncedCustomer;
     return {
       customer: syncedCustomer,
       offers: queued.offers || [],
@@ -242,7 +264,7 @@ function viewStorageFailure() {
 function offlineNotice() {
   if (S.sync === "ONLINE" && !S.pendingCount) return "";
   const states = {
-    LOCAL_ONLY: ["Нет связи с ноутбуком.", "Локальные данные доступны; операции останутся на этом телефоне."],
+    LOCAL_ONLY: ["Нет связи с сервером.", "Локальные данные доступны; операции останутся на этом телефоне."],
     SYNCING: ["Синхронизация.", "Локальные операции сохранены."],
     PENDING: [`Ожидает синхронизации: ${S.pendingCount}.`, "Операции сохранены на телефоне."],
     SYNC_ERROR: ["Ошибка синхронизации.", "Данные и очередь сохранены; повтор будет выполнен автоматически."],
@@ -851,6 +873,24 @@ document.addEventListener("click", (e) => {
 });
 
 let retryDelay = 1000, retryTimer = null;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function synchronizeOperation(operationId) {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const result = await Offline.synchronize(api);
+    const entry = (await Offline.pending()).find((item) => item.operation_id === operationId);
+    if (!entry || entry.last_error) return;
+    if (result.synchronized === false && result.reason !== "busy") return;
+    if (attempt < 19) await wait(250);
+  }
+}
+function scheduleSynchronizationRetry() {
+  if (retryTimer || !S.role) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    retryDelay = Math.min(retryDelay * 2, 300000);
+    retrySynchronization();
+  }, retryDelay);
+}
 async function finishSyncState() {
   S.syncError = "";
   S.reauthRequired = false;
@@ -890,13 +930,7 @@ async function retrySynchronization() {
   } catch (e) {
     await failSyncState(e);
     refreshSyncNotice();
-    if (e.net && !retryTimer && S.role) {
-      retryTimer = setTimeout(() => {
-        retryTimer = null;
-        retryDelay = Math.min(retryDelay * 2, 300000);
-        retrySynchronization();
-      }, retryDelay);
-    }
+    if (e.net) scheduleSynchronizationRetry();
   }
 }
 window.addEventListener("online", () => { if (S.server_url) retrySynchronization(); });
