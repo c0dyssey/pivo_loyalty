@@ -12,6 +12,16 @@ import tempfile
 import time
 import uuid
 
+if os.name == "nt":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is not None:
+            try:
+                stream.reconfigure(encoding="utf-8")
+            except (AttributeError, ValueError):
+                pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 CTX = ssl.create_default_context()
@@ -71,6 +81,7 @@ class Client:
         c = http.client.HTTPSConnection("127.0.0.1", self.port, timeout=20, context=CTX)
         h = {"X-Requested-With": "pivo", "Content-Type": "application/json", "Cookie": self.cookie}
         c.request(method, path, json.dumps(body), h)
+        time.sleep(0.05)
         c.sock.setsockopt(__import__("socket").SOL_SOCKET, __import__("socket").SO_LINGER, __import__("struct").pack("ii", 1, 0))
         c.close()
 

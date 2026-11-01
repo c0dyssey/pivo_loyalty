@@ -94,5 +94,6 @@ td.n,th.n{text-align:right}
 .rowc .d{display:none;margin-top:10px}
 .rowc.open .d{display:block}
 .warn{background:var(--redbg);color:var(--red);border:1px solid var(--red);border-radius:12px;padding:10px 12px;margin:10px 0;font-size:14px}
+.offline-note{background:var(--amberbg);color:var(--ink);border-color:var(--amber2)}
 
 .cartlines{max-height:28vh;overflow-y:auto}

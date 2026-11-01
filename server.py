@@ -10,8 +10,10 @@ import csv
 import errno
 import hashlib
 import hmac
+import ipaddress
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -21,12 +23,23 @@ import ssl
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import certgen
 import qr
+
+if os.name == "nt":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("PIVO_DATA", os.path.join(BASE, "data"))
@@ -48,6 +61,11 @@ ID_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 RID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 ROLE = "staff"
 PORT = int(os.environ.get("PIVO_PORT", "8443"))      # единственный порт: HTTPS
+ALLOWED_PWA_ORIGINS = {
+    origin.strip().rstrip("/")
+    for origin in os.environ.get("PIVO_ALLOWED_ORIGINS", "https://c0dyssey.github.io").split(",")
+    if origin.strip() and origin.strip() != "*"
+}
 
 DISK_MSG = ("Не удалось записать данные на диск (возможно, нет места или нет доступа к файлу). "
             "Операция НЕ выполнена и не сохранена. Освободите место и повторите.")
@@ -68,6 +86,7 @@ PALETTE = ["#d97706", "#0ea5e9", "#16a34a", "#dc2626", "#7c3aed", "#0d9488", "#d
 
 LOCK = threading.RLock()
 STATE = {"data": None, "conf": None, "locked": None}
+SYNC_CONTEXT = None
 STATUS = {"backup": {"ok": None, "name": None, "error": None, "ts": None}}
 SETTINGS = {"mtime": None, "shop": DEFAULT_SETTINGS["shop"], "drinks": [], "error": None}
 SESSIONS = {}       # token -> {"seen":...}
@@ -127,9 +146,11 @@ def half(x):
     """литры -> целые половинки; None если не кратно 0.5"""
     try:
         v = float(x)
-    except (TypeError, ValueError):
+        if not math.isfinite(v):
+            return None
+        h = round(v * 2)
+    except (TypeError, ValueError, OverflowError):
         return None
-    h = round(v * 2)
     if abs(v * 2 - h) > 1e-9:
         return None
     return int(h)
@@ -249,6 +270,8 @@ def validate_data(d):
         raise ValueError("нет счётчика операций")
     if not isinstance(d.setdefault("requests", {}), dict):
         raise ValueError("раздел «requests» повреждён")
+    if d.setdefault("sync_device_id", None) is not None and not isinstance(d["sync_device_id"], str):
+        raise ValueError("идентификатор устройства синхронизации повреждён")
     for cid, c in d["customers"].items():
         if not isinstance(c, dict) or c.get("id") != cid or not all(isinstance(c.get(k), str) for k in ("name", "surname", "phone", "created")):
             raise ValueError(f"клиент {cid}: повреждена запись")
@@ -301,7 +324,8 @@ def describe_file(path, key, label):
 
 
 def skeleton():
-    return {"version": 3, "next_op": 1, "drinks": [], "customers": {}, "ops": [], "requests": {}}
+    return {"version": 3, "next_op": 1, "drinks": [], "customers": {}, "ops": [], "requests": {},
+            "sync_device_id": None}
 
 
 def backup_names():
@@ -660,7 +684,7 @@ def customer_view(c, with_history=False, limit=60, ops=None):
     }
     if with_history:
         hist = [o for o in STATE["data"]["ops"] if o["customer"] == c["id"] and o["type"] != "register"][-limit:][::-1]
-        v["history"] = [{"id": o["id"], "ts": o["ts"], "type": o["type"], "undone": bool(o.get("undone")),
+        v["history"] = [{"id": o["id"], "operation_id": o.get("operation_id"), "ts": o["ts"], "type": o["type"], "undone": bool(o.get("undone")),
                          "items": op_items(o)} for o in hist]
     return v
 
@@ -680,6 +704,8 @@ def new_customer_id():
 
 def add_op(op):
     d = STATE["data"]
+    if SYNC_CONTEXT:
+        op.update({k: SYNC_CONTEXT[k] for k in ("operation_id", "device_id", "client_sequence")})
     op["id"] = d["next_op"]
     d["next_op"] += 1
     op["ts"] = now_iso()
@@ -703,17 +729,33 @@ class ApiError(Exception):
 def prune_requests():
     d = STATE["data"]
     cutoff = (datetime.now() - timedelta(days=REQUEST_TTL_DAYS)).replace(microsecond=0).isoformat()
-    old = [k for k, v in d["requests"].items() if v.get("ts", "") < cutoff]
+    old = [k for k, v in d["requests"].items() if not v.get("sync_fp") and v.get("ts", "") < cutoff]
     for k in old:
         del d["requests"][k]
     return len(old)
 
 
 def remember(rid, fp, kind, cid, extra=None):
-    STATE["data"]["requests"][rid] = dict({"fp": fp, "ts": now_iso(), "kind": kind, "cid": cid}, **(extra or {}))
+    rec = {"fp": fp, "ts": now_iso(), "kind": kind, "cid": cid}
+    if SYNC_CONTEXT:
+        rec.update(SYNC_CONTEXT)
+    rec.update(extra or {})
+    if SYNC_CONTEXT:
+        rec["result"] = {
+            "operation_id": SYNC_CONTEXT["operation_id"],
+            "customer_id": cid,
+            "server_operation_ids": [op["id"] for op in STATE["data"]["ops"]
+                                     if op.get("operation_id") == SYNC_CONTEXT["operation_id"]],
+        }
+    STATE["data"]["requests"][rid] = rec
 
 
 def replay(r):
+    if r.get("sync_fp") and "result" in r:
+        result = json.loads(json.dumps(r["result"], ensure_ascii=False))
+        if isinstance(result, dict):
+            result["replay"] = True
+        return result
     c = STATE["data"]["customers"].get(r["cid"])
     if not c:
         raise ApiError("Клиент не найден", 404)
@@ -740,6 +782,153 @@ def idem(kind, key, body, run):
     return run(rid, fp)
 
 
+def validate_sync_operation(op):
+    if not isinstance(op, dict):
+        raise ApiError("Операция должна быть объектом")
+    opid = op.get("operation_id")
+    try:
+        if not isinstance(opid, str) or str(uuid.UUID(opid)) != opid.lower():
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise ApiError("Некорректный operation_id")
+    device_id = op.get("device_id")
+    try:
+        if not isinstance(device_id, str) or str(uuid.UUID(device_id)) != device_id.lower():
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise ApiError("Некорректный device_id")
+    if not isinstance(op.get("customer_id"), str) or not re.match(r"^[A-Z2-9]{8}$", op["customer_id"]):
+        raise ApiError("Некорректный customer_id")
+    if type(op.get("client_sequence")) is not int or op["client_sequence"] < 1:
+        raise ApiError("Некорректный client_sequence")
+    if type(op.get("base_version")) is not int or op["base_version"] < 0:
+        raise ApiError("Некорректный base_version")
+    if not isinstance(op.get("created_at"), str) or not isinstance(op.get("payload"), dict):
+        raise ApiError("Некорректная структура операции")
+    if op.get("operation_type") not in ("register", "purchase", "redemption"):
+        raise ApiError("Неизвестный тип операции")
+    payload = op["payload"]
+    if op["operation_type"] == "register":
+        if not isinstance(payload.get("name"), str) or not payload["name"].strip():
+            raise ApiError("Для регистрации требуется имя")
+        if not isinstance(payload.get("phone"), str):
+            raise ApiError("Для регистрации требуется телефон")
+    elif op["operation_type"] == "purchase":
+        if not _check_items(payload.get("items")):
+            raise ApiError("Неверные позиции покупки")
+    elif not _check_items(payload.get("items")):
+        raise ApiError("Неверные позиции списания")
+    return op
+
+
+def sync_register_device(device_id):
+    try:
+        if not isinstance(device_id, str) or str(uuid.UUID(device_id)) != device_id.lower():
+            raise ValueError()
+    except (ValueError, AttributeError):
+        raise ApiError("Некорректный device_id")
+    d = STATE["data"]
+    registered = d.get("sync_device_id")
+    if registered and registered != device_id:
+        raise ApiError("Для этого магазина уже зарегистрировано другое устройство синхронизации.", 409,
+                       {"code": "device_conflict"})
+    if not registered:
+        d["sync_device_id"] = device_id
+        commit(lambda: d.__setitem__("sync_device_id", None))
+    return {"ok": True, "device_id": device_id}
+
+
+def sync_process_operation(op):
+    global SYNC_CONTEXT
+    op = validate_sync_operation(op)
+    if op["device_id"] != STATE["data"].get("sync_device_id"):
+        raise ApiError("Устройство не зарегистрировано для синхронизации.", 409,
+                       {"code": "device_conflict"})
+    opid = op["operation_id"]
+    sync_fp = hashlib.sha256(json.dumps(op, sort_keys=True, ensure_ascii=False,
+                                        separators=(",", ":")).encode("utf-8")).hexdigest()
+    prior = STATE["data"]["requests"].get(opid)
+    if prior:
+        if prior.get("sync_fp") != sync_fp:
+            raise ApiError("Этот operation_id уже использован для другой операции.", 409,
+                           {"code": "idempotency_conflict"})
+        return replay(prior)
+
+    SYNC_CONTEXT = {
+        "sync_fp": sync_fp,
+        "device_id": op["device_id"],
+        "client_sequence": op["client_sequence"],
+        "operation_id": opid,
+    }
+    body = dict(op["payload"], request_id=opid)
+    try:
+        try:
+            if op["operation_type"] == "register":
+                body["customer_id"] = op["customer_id"]
+                idem("register", "", body, lambda rid, fp: api_register(body, rid, fp))
+            elif op["operation_type"] == "purchase":
+                idem("purchase", op["customer_id"], body,
+                     lambda rid, fp: api_purchase(op["customer_id"], body, rid, fp))
+            else:
+                idem("redeem", op["customer_id"], body,
+                     lambda rid, fp: api_redeem(op["customer_id"], body, rid, fp))
+        except ApiError as e:
+            e.extra = dict(e.extra or {}, code="business_conflict")
+            raise
+        return STATE["data"]["requests"][opid]["result"]
+    finally:
+        SYNC_CONTEXT = None
+
+
+def sync_push(operations):
+    if not isinstance(operations, list) or not operations or len(operations) > 50:
+        raise ApiError("Передайте от 1 до 50 операций")
+    results = []
+    for op in operations:
+        try:
+            result = sync_process_operation(op)
+            opid = op.get("operation_id") if isinstance(op, dict) else None
+            server_ids = [item["id"] for item in STATE["data"]["ops"] if item.get("operation_id") == opid]
+            results.append({"operation_id": opid, "acknowledged": True,
+                            "server_operation_ids": server_ids, "result": result})
+        except ApiError as e:
+            results.append({
+                "operation_id": op.get("operation_id") if isinstance(op, dict) else None,
+                "acknowledged": False,
+                "error": e.msg,
+                "status": e.code,
+                "conflict": e.code == 409 or (e.extra or {}).get("code") == "business_conflict",
+                "code": (e.extra or {}).get("code", "operation_rejected"),
+            })
+    return {"results": results}
+
+
+def sync_pull(since):
+    if not since.isdigit():
+        raise ApiError("Некорректный курсор синхронизации")
+    cursor = int(since)
+    current = STATE["data"]["next_op"] - 1
+    if cursor > current:
+        raise ApiError("Курсор синхронизации находится в будущем")
+    page = [o for o in STATE["data"]["ops"] if o["id"] > cursor][:500]
+    new_cursor = page[-1]["id"] if page else cursor
+    changed = set(STATE["data"]["customers"])
+    products = {"shop": SETTINGS["shop"], "drinks": [dict(d) for d in STATE["data"]["drinks"]]}
+    products["version"] = hashlib.sha256(json.dumps(products, sort_keys=True, ensure_ascii=False,
+                                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {
+        "changes": {
+            "customers": [customer_view(STATE["data"]["customers"][cid], True) for cid in sorted(changed)],
+            "operations": [dict(o) for o in page],
+            "processed_operation_ids": [rid for rid, record in STATE["data"]["requests"].items()
+                                        if record.get("sync_fp")],
+            "products": products,
+        },
+        "cursor": new_cursor,
+        "has_more": new_cursor < current,
+    }
+
+
 # ---------------------------------------------------------------- операции
 def api_register(body, rid, fp):
     name = (body.get("name") or "").strip()[:60]
@@ -753,18 +942,23 @@ def api_register(body, rid, fp):
     for c in d["customers"].values():
         if c["phone"] == phone:
             raise ApiError(f"Этот номер уже есть: {c['name']} {c['surname']}".strip(), 409)
-    cid = new_customer_id()
+    cid = str(body.get("customer_id") or new_customer_id()).upper()
+    if not re.match(r"^[A-Z2-9]{8}$", cid):
+        raise ApiError("Некорректный код клиента")
+    if cid in d["customers"]:
+        raise ApiError("Код клиента уже занят", 409)
     c = {"id": cid, "name": name, "surname": surname, "phone": phone, "created": now_iso()}
     d["customers"][cid] = c
     add_op({"type": "register", "customer": cid, "by": ROLE})
-    remember(rid, fp, "register", cid)
+    result = customer_view(c, True)
+    remember(rid, fp, "register", cid, {"result": result} if SYNC_CONTEXT else None)
 
     def rb():
         d["customers"].pop(cid, None)
         drop_last_op()
         d["requests"].pop(rid, None)
     commit(rb)
-    return customer_view(c, True)
+    return result
 
 
 def api_purchase(cid, body, rid, fp):
@@ -792,13 +986,17 @@ def api_purchase(cid, body, rid, fp):
     offers = []
     if after["avail_h"] > 0:
         offers.append({"avail": lit(after["avail_h"]), "new": after["earned"] > before["earned"]})
-    remember(rid, fp, "purchase", cid, {"offers": offers})
+    result = {"customer": customer_view(c, True), "offers": offers}
+    extra = {"offers": offers}
+    if SYNC_CONTEXT:
+        extra["result"] = result
+    remember(rid, fp, "purchase", cid, extra)
 
     def rb():
         drop_last_op()
         d["requests"].pop(rid, None)
     commit(rb)
-    return {"customer": customer_view(c, True), "offers": offers}
+    return result
 
 
 def api_redeem(cid, body, rid, fp):
@@ -841,7 +1039,8 @@ def api_redeem(cid, body, rid, fp):
         raise ApiError(f"Можно списать не больше {str(lit(avail)).replace('.', ',')} л")
     for did, h in merged.items():
         add_op({"type": "redeem", "customer": cid, "drink": did, "liters": lit(h), "by": ROLE})
-    remember(rid, fp, "redeem", cid)
+    result = {"customer": customer_view(c, True)}
+    remember(rid, fp, "redeem", cid, {"result": result} if SYNC_CONTEXT else None)
     n = len(merged)
 
     def rb():
@@ -849,7 +1048,7 @@ def api_redeem(cid, body, rid, fp):
             drop_last_op()
         d["requests"].pop(rid, None)
     commit(rb)
-    return {"customer": customer_view(c, True)}
+    return result
 
 
 def undo_plan(opid):
@@ -887,7 +1086,8 @@ def api_undo_apply(opid, rid, fp):
     for o in flagged:
         o["undone"], o["undone_ts"] = True, stamp
     cid = op["customer"]
-    remember(rid, fp, "undo", cid)
+    result = {"customer": customer_view(STATE["data"]["customers"][cid], True)}
+    remember(rid, fp, "undo", cid, {"result": result} if SYNC_CONTEXT else None)
 
     def rb():
         for o in flagged:
@@ -895,7 +1095,7 @@ def api_undo_apply(opid, rid, fp):
             o.pop("undone_ts", None)
         STATE["data"]["requests"].pop(rid, None)
     commit(rb)
-    return {"customer": customer_view(STATE["data"]["customers"][cid], True)}
+    return result
 
 
 def api_edit(cid, b):
@@ -1027,11 +1227,22 @@ def api_export_csv():
 
 # ---------------------------------------------------------------- HTTP (только HTTPS)
 MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
-        ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".json": "application/json"}
+        ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
+        ".json": "application/json", ".webmanifest": "application/manifest+json; charset=utf-8"}
 
 
 def is_local(ip):
     return ip in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+
+def is_private_client(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        return addr.is_loopback or addr.is_private or addr.is_link_local
+    except ValueError:
+        return False
 
 
 def write_conf(conf):
@@ -1070,19 +1281,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
-                         "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; media-src 'self' blob:")
+                         "default-src 'self'; connect-src 'self' https:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; media-src 'self' blob:")
+        for k, v in getattr(self, "_cors", {}).items():
+            self.send_header(k, v)
         for k, v in (extra or {}).items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
     def session(self):
-        m = re.search(r"(?:^|;\s*)sid=([A-Za-z0-9_\-]+)", self.headers.get("Cookie", ""))
-        s = SESSIONS.get(m.group(1)) if m else None
+        authorization = self.headers.get("Authorization", "")
+        bearer = re.fullmatch(r"Bearer ([A-Za-z0-9_-]+)", authorization)
+        if authorization:
+            sid = bearer.group(1) if bearer else None
+        else:
+            cookie = re.search(r"(?:^|;\s*)sid=([A-Za-z0-9_\-]+)", self.headers.get("Cookie", ""))
+            sid = cookie.group(1) if cookie else None
+        s = SESSIONS.get(sid) if sid else None
         if not s:
             return None
         if time.time() - s["seen"] > SESSION_IDLE_SEC:
-            SESSIONS.pop(m.group(1), None)
+            SESSIONS.pop(sid, None)
             return None
         s["seen"] = time.time()
         return s
@@ -1102,9 +1321,40 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.route("POST")
 
+    def do_OPTIONS(self):
+        self.route("OPTIONS")
+
     def route(self, method):
         try:
+            self._cors = {}
+            origin = self.headers.get("Origin", "").rstrip("/")
+            if origin in ALLOWED_PWA_ORIGINS:
+                self._cors = {
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Requested-With",
+                    "Access-Control-Max-Age": "600",
+                    "Vary": "Origin",
+                }
+            if not is_private_client(self.ip()):
+                raise ApiError("Доступ разрешён только из локальной сети.", 403)
             u = urlparse(self.path)
+            if method == "OPTIONS":
+                if not u.path.startswith("/api/") or origin not in ALLOWED_PWA_ORIGINS:
+                    raise ApiError("Источник не разрешён для PWA.", 403)
+                requested_method = self.headers.get("Access-Control-Request-Method", "").upper()
+                requested_headers = {
+                    item.strip().lower()
+                    for item in self.headers.get("Access-Control-Request-Headers", "").split(",")
+                    if item.strip()
+                }
+                allowed_headers = {"authorization", "content-type", "x-requested-with"}
+                if requested_method not in ("GET", "POST") or not requested_headers.issubset(allowed_headers):
+                    raise ApiError("Параметры запроса из PWA не разрешены.", 403)
+                extra = {}
+                if self.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+                    extra["Access-Control-Allow-Private-Network"] = "true"
+                return self.send(204, "", extra=extra)
             self._raw = b""
             if method == "POST":                    # тело всегда вычитывается: иначе закрытие сокета сбросит уже отправленный ответ
                 n = int(self.headers.get("Content-Length") or 0)
@@ -1167,6 +1417,7 @@ class Handler(BaseHTTPRequestHandler):
                     "shop": SETTINGS["shop"], "tls_port": PORT, "locked": STATE["locked"],
                     "warnings": warnings_list() if s else [],
                     "drinks": [d for d in STATE["data"]["drinks"] if d["active"]] if s else [],
+                    "all_drinks": [dict(d) for d in STATE["data"]["drinks"]] if s else [],
                 })
         if ep == "setup" and method == "POST":
             if conf is not None:
@@ -1193,12 +1444,15 @@ class Handler(BaseHTTPRequestHandler):
             FAILS.pop(self.ip(), None)
             sid = secrets.token_urlsafe(24)
             SESSIONS[sid] = {"seen": time.time()}
-            return self.send(200, {"role": ROLE}, extra={
+            return self.send(200, {"role": ROLE, "token": sid}, extra={
                 "Set-Cookie": f"sid={sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400"})
         if ep == "logout" and method == "POST":
-            m = re.search(r"sid=([A-Za-z0-9_\-]+)", self.headers.get("Cookie", ""))
-            if m:
-                SESSIONS.pop(m.group(1), None)
+            authorization = self.headers.get("Authorization", "")
+            bearer = re.fullmatch(r"Bearer ([A-Za-z0-9_-]+)", authorization)
+            cookie = re.search(r"sid=([A-Za-z0-9_\-]+)", self.headers.get("Cookie", ""))
+            sid = bearer.group(1) if bearer else (cookie.group(1) if cookie else None)
+            if sid:
+                SESSIONS.pop(sid, None)
             return self.send(200, {"ok": True}, extra={"Set-Cookie": "sid=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"})
 
         # восстановление: только на самом компьютере (localhost), перепроверка PIN
@@ -1225,6 +1479,19 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             if STATE["locked"]:
                 raise ApiError(LOCKED_MSG + " " + STATE["locked"]["reason"], 503, {"locked": STATE["locked"]})
+            if ep == "sync/status" and method == "GET":
+                return self.send(200, {
+                    "cursor": STATE["data"]["next_op"] - 1,
+                    "device_id": STATE["data"].get("sync_device_id"),
+                    "products": {"shop": SETTINGS["shop"],
+                                 "drinks": [dict(d) for d in STATE["data"]["drinks"]]},
+                })
+            if ep == "sync/register" and method == "POST":
+                return self.send(200, sync_register_device(self.read_body().get("device_id")))
+            if ep == "sync/push" and method == "POST":
+                return self.send(200, sync_push(self.read_body().get("operations")))
+            if ep == "sync/pull" and method == "GET":
+                return self.send(200, sync_pull(query.get("since", ["0"])[0]))
             if ep == "search":
                 return self.send(200, api_search(query.get("q", [""])[0]))
             if ep == "customers" and method == "POST":

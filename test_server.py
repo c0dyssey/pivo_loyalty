@@ -5,8 +5,10 @@ import os
 import sys
 import time
 import urllib.parse
+import uuid
 
 from tests_common import CTX, Env, Client as _Client, check
+import server
 
 ENV = Env()
 PORT = ENV.port
@@ -62,6 +64,24 @@ def main():
         check(st == 401, "без входа API закрыт")
         st, j = s.call("POST", "/api/login", {"pin": "48291"})
         check(st == 200 and j.get("role") == "staff", "вход по PIN (один аккаунт)")
+        token = j.get("token", "")
+        st, cross_origin_state = s.call("GET", "/api/state", headers={
+            "Authorization": "Bearer " + token, "Cookie": "", "Origin": "https://c0dyssey.github.io",
+        })
+        check(st == 200 and cross_origin_state["role"] == "staff" and
+              s.last_headers.get("access-control-allow-origin") == "https://c0dyssey.github.io",
+              "GitHub Pages авторизуется bearer-токеном и получает CORS-доступ")
+        st, _ = s.call("OPTIONS", "/api/sync/push", headers={
+            "Origin": "https://c0dyssey.github.io", "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type,x-requested-with",
+            "Access-Control-Request-Private-Network": "true",
+        })
+        check(st == 204 and s.last_headers.get("access-control-allow-private-network") == "true",
+              "разрешён CORS preflight GitHub Pages к локальному HTTPS API")
+        st, _ = s.call("OPTIONS", "/api/state", headers={
+            "Origin": "https://evil.example", "Access-Control-Request-Method": "GET",
+        })
+        check(st == 403, "CORS preflight неизвестного сайта отклонён")
         st, _ = s.call("POST", "/api/customers", {"name": "A"}, headers={"X-Requested-With": ""})
         check(st == 403, "CSRF: POST без заголовка отклонён")
 
@@ -252,6 +272,18 @@ def main():
             check(st == 404, f"{path} по HTTP не отдаётся")
         st, body = s.call("GET", "/qrdec.js", raw=True)
         check(st == 200 and b"QRDec" in body, "декодер QR отдаётся")
+        st, body = s.call("GET", "/manifest.webmanifest", raw=True)
+        manifest = json.loads(body.decode("utf-8")) if st == 200 else {}
+        check(st == 200 and "standalone" == manifest.get("display") and
+              any(icon.get("sizes") == "192x192" for icon in manifest.get("icons", [])) and
+              any(icon.get("sizes") == "512x512" for icon in manifest.get("icons", [])) and
+              "application/manifest+json" in s.last_headers.get("content-type", ""), "PWA manifest отдаётся с корректным MIME-типом и иконками")
+        st, body = s.call("GET", "/sw.js", raw=True)
+        check(st == 200 and b"APP_SHELL" in body and b"/api/" in body, "service worker кэширует оболочку, но пропускает API")
+        st, body = s.call("GET", "/offline.js", raw=True)
+        check(st == 200 and b"indexedDB.open" in body and b"sync_metadata" in body, "клиентский модуль IndexedDB доступен")
+        check(server.is_private_client("192.168.1.15") and server.is_private_client("::1") and
+              not server.is_private_client("8.8.8.8"), "сервер разрешает только loopback/private/link-local сети")
 
         # --- HTTPS
         try:
@@ -275,6 +307,67 @@ def main():
         check(any(x["name"] == "Вайсбург Лагер" for x in j["drinks"]), "напитки на месте после перезапуска")
         check(any(f.startswith("data-") for f in os.listdir(os.path.join(TMP, "data", "backups"))), "создана резервная копия")
         check(not os.path.exists(os.path.join(TMP, "data", "data.json.tmp")), "нет недописанных временных файлов")
+
+        # --- офлайн-синхронизация: постоянное устройство, идемпотентный push и cursor pull
+        device_id = str(uuid.uuid4())
+        st, sync_state = s2.call("GET", "/api/sync/status")
+        check(st == 200 and sync_state["device_id"] is None, "sync/status сообщает курсор и незарегистрированное устройство")
+        st, j = s2.call("POST", "/api/sync/register", {"device_id": device_id})
+        check(st == 200 and j["device_id"] == device_id, "первое устройство регистрации синхронизации принимается")
+        other_device = str(uuid.uuid4())
+        st, j = s2.call("POST", "/api/sync/register", {"device_id": other_device})
+        check(st == 409 and j.get("code") == "device_conflict", "другое устройство отклонено")
+        cid_sync = "ABCD2345"
+        registration = {
+            "operation_id": str(uuid.uuid4()), "device_id": device_id, "operation_type": "register",
+            "customer_id": cid_sync, "payload": {"name": "Offline", "surname": "", "phone": "0501112233"},
+            "created_at": "2026-01-01T00:00:00", "client_sequence": 1, "base_version": sync_state["cursor"],
+        }
+        st, pushed = s2.call("POST", "/api/sync/push", {"operations": [registration]})
+        ack = pushed["results"][0]
+        check(st == 200 and ack["acknowledged"] and ack["result"]["customer_id"] == cid_sync,
+              "offline-регистрация применена с клиентским ID")
+        st, repeated = s2.call("POST", "/api/sync/push", {"operations": [registration]})
+        check(st == 200 and repeated["results"][0]["acknowledged"] and repeated["results"][0]["result"]["replay"],
+              "повтор push не дублирует регистрацию")
+        changed = dict(registration, payload=dict(registration["payload"], name="Changed"))
+        st, conflict = s2.call("POST", "/api/sync/push", {"operations": [changed]})
+        check(st == 200 and not conflict["results"][0]["acknowledged"] and conflict["results"][0]["code"] == "idempotency_conflict",
+              "изменённый payload с тем же operation_id конфликтует")
+        purchase = {
+            "operation_id": str(uuid.uuid4()), "device_id": device_id, "operation_type": "purchase",
+            "customer_id": cid_sync, "payload": {"items": [{"drink": lager, "liters": 2}]},
+            "created_at": "2026-01-01T00:00:01", "client_sequence": 2, "base_version": sync_state["cursor"],
+        }
+        invalid_redemption = {
+            "operation_id": str(uuid.uuid4()), "device_id": device_id, "operation_type": "redemption",
+            "customer_id": cid_sync, "payload": {"items": [{"drink": lager, "liters": 1}]},
+            "created_at": "2026-01-01T00:00:02", "client_sequence": 3, "base_version": sync_state["cursor"],
+        }
+        st, pushed = s2.call("POST", "/api/sync/push", {"operations": [purchase, invalid_redemption]})
+        check(st == 200 and pushed["results"][0]["acknowledged"] and not pushed["results"][1]["acknowledged"] and
+              pushed["results"][1]["conflict"], "частичный push сохраняет успехи рядом с конфликтными операциями")
+        later_purchase = dict(purchase, operation_id=str(uuid.uuid4()), client_sequence=4,
+                              payload={"items": [{"drink": lager, "liters": 1}]})
+        st, later = s2.call("POST", "/api/sync/push", {"operations": [later_purchase]})
+        st, replayed = s2.call("POST", "/api/sync/push", {"operations": [purchase]})
+        previous_result = pushed["results"][0]["result"]
+        replay_result = replayed["results"][0]["result"]
+        check(st == 200 and later["results"][0]["acknowledged"] and replay_result.get("replay") and
+              {k: v for k, v in replay_result.items() if k != "replay"} == previous_result and
+              replayed["results"][0]["server_operation_ids"] == pushed["results"][0]["server_operation_ids"],
+              "повтор push возвращает сохранённое подтверждение без повторного применения")
+        invalid_purchase = dict(later_purchase, operation_id=str(uuid.uuid4()), client_sequence=5,
+                                payload={"items": [{"drink": lager, "liters": float("nan")}]})
+        st, invalid = s2.call("POST", "/api/sync/push", {"operations": [invalid_purchase]})
+        check(st == 200 and not invalid["results"][0]["acknowledged"] and invalid["results"][0]["code"] == "operation_rejected",
+              "нечисловой объём отклоняется отдельно, не прерывая sync API")
+        st, pulled = s2.call("GET", f"/api/sync/pull?since={sync_state['cursor']}")
+        local_customer = next((c for c in pulled.get("changes", {}).get("customers", []) if c["id"] == cid_sync), None)
+        check(st == 200 and pulled["cursor"] > sync_state["cursor"] and local_customer and local_customer["total_paid"] == 3,
+              "pull возвращает обновлённого клиента и новый курсор")
+        st, _ = s2.call("POST", "/api/sync/register", {"device_id": device_id})
+        check(st == 200, "идентификатор устройства сохраняется после перезапуска")
         bad = Client()
         for _ in range(5):
             st, _ = bad.call("POST", "/api/login", {"pin": "0000"})

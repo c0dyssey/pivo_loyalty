@@ -7,7 +7,7 @@ const uid = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() : Ma
 const fdt = (ts) => { const d = new Date(ts); return d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }) + " " + d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }); };
 const fd = (ts) => (ts ? new Date(ts).toLocaleDateString("ru-RU") : "—");
 
-let S = { role: null, drinks: [], shop: "", setup_needed: false, local: false, tls_port: 0 };
+let S = { role: null, drinks: [], shop: "", setup_needed: false, local: false, tls_port: 0, offline: false };
 let C = null;          // открытая карточка клиента
 let cart = {};         // drink id -> половинки литра
 let selDrink = null;
@@ -15,32 +15,122 @@ let busy = false;
 let searchMode = "tel";
 let lastQuery = "";
 let qrFresh = false;
+let qrObjectUrl = null;
 let CS = { data: null, sort: "paid", q: "", open: null };
 
+const host = location.hostname.toLowerCase();
+const isPagesHost = host.endsWith(".github.io") ||
+  (location.protocol === "https:" && !["localhost", "127.0.0.1", "::1"].includes(host) &&
+   !/^10\./.test(host) && !/^192\.168\./.test(host) && !/^172\.(1[6-9]|2\d|3[01])\./.test(host) &&
+   !/^169\.254\./.test(host) && !host.endsWith(".local"));
+async function serverAddress() {
+  const configured = await Offline.serverUrl();
+  if (configured) return configured;
+  return isPagesHost ? "" : location.origin;
+}
+function validateServerAddress(value) {
+  let url;
+  try { url = new URL(value.trim()); } catch (e) { throw new Error("Введите полный адрес, например https://192.168.1.25:8443"); }
+  if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.search || url.hash ||
+      (url.pathname !== "/" && url.pathname !== "")) {
+    throw new Error("Нужен HTTPS-адрес сервера без пути, например https://192.168.1.25:8443");
+  }
+  return url.origin;
+}
+async function apiUrl(path) {
+  const base = await serverAddress();
+  if (!base) throw new Error("Сначала укажите HTTPS-адрес сервера ноутбука в локальной сети.");
+  return base + "/api/" + path;
+}
 async function api(path, body, mutation) {
-  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-Requested-With": "pivo" }, body: JSON.stringify(body) };
+  const headers = {};
+  const token = await Offline.getAuthToken();
+  if (token) headers.Authorization = "Bearer " + token;
+  const opt = { credentials: "omit", headers };
+  if (body !== undefined) {
+    opt.method = "POST";
+    opt.headers = Object.assign(headers, { "Content-Type": "application/json", "X-Requested-With": "pivo" });
+    opt.body = JSON.stringify(body);
+  }
   let r;
-  try { r = await fetch("/api/" + path, opt); } catch (e) {
-    const err = new Error(mutation ? "Ответ от сервера не получен. Операция могла записаться: проверьте историю клиента. Повторное нажатие безопасно, дубля не будет." : "Нет связи с сервером. Проверьте Wi-Fi и что программа на ПК запущена.");
+  try { r = await fetch(await apiUrl(path), opt); } catch (e) {
+    const err = new Error(mutation ? "Ответ от сервера не получен. Операция могла записаться: проверьте историю клиента. Повторное нажатие безопасно, дубля не будет."
+      : "Нет связи с сервером. Проверьте Wi-Fi, HTTPS-сертификат и адрес сервера в локальной сети.");
     err.net = true; throw err;
   }
   let j = {};
   try { j = await r.json(); } catch (e) { /* не JSON */ }
-  if (r.status === 401 && path !== "login") { S.role = null; render(); throw new Error("Сессия закончилась. Введите PIN."); }
+  if (r.status === 401 && path !== "login") {
+    await Offline.rememberAuthentication(false);
+    S.role = null; render();
+    const err = new Error("Сессия закончилась. Введите PIN.");
+    err.auth = true; err.status = r.status; throw err;
+  }
   if (r.status === 503 && j.locked) { S.locked = j.locked; render(); throw new Error(j.error); }
-  if (!r.ok) throw new Error(j.error || "Ошибка сервера (" + r.status + ")");
+  if (!r.ok) {
+    const err = new Error(j.error || "Ошибка сервера (" + r.status + ")");
+    err.status = r.status; throw err;
+  }
   return j;
 }
-// Идентификатор операции хранится, пока нет окончательного ответа: повтор после потери ответа не создаёт дубль
-let PEND = {};
-try { PEND = JSON.parse(sessionStorage.getItem("pend") || "{}"); } catch (e) { PEND = {}; }
-const savePend = () => { try { sessionStorage.setItem("pend", JSON.stringify(PEND)); } catch (e) { /* без хранилища ID живёт до перезагрузки */ } };
+async function apiBlob(path) {
+  const headers = {};
+  const token = await Offline.getAuthToken();
+  if (token) headers.Authorization = "Bearer " + token;
+  const response = await fetch(await apiUrl(path), { credentials: "omit", headers });
+  if (response.status === 401) {
+    await Offline.rememberAuthentication(false);
+    S.role = null;
+    render();
+    throw new Error("Сессия закончилась. Войдите снова.");
+  }
+  if (!response.ok) throw new Error("Не удалось получить файл от сервера (" + response.status + ")");
+  return response.blob();
+}
 async function mut(key, path, body) {
-  if (!PEND[key]) { PEND[key] = uid(); savePend(); }
+  let type = null, customerId = null, payload = body;
+  if (path === "customers") {
+    type = "register";
+    customerId = await Offline.newCustomerId();
+  } else if (path.endsWith("/purchase")) {
+    type = "purchase";
+    customerId = path.split("/")[1];
+  } else if (path.endsWith("/redeem")) {
+    type = "redemption";
+    customerId = path.split("/")[1];
+  }
+  if (type) {
+    const queued = await Offline.enqueue(type, customerId, payload, Offline.requestOperationId());
+    let syncResult = null;
+    try {
+      syncResult = await Offline.synchronize(api);
+      S.offline = !navigator.onLine || syncResult.reason === "offline";
+      S.syncError = null;
+    } catch (e) {
+      S.offline = true;
+      S.syncError = e.message;
+    }
+    const customer = await Offline.getCustomer(customerId);
+    const pending = await Offline.outboxCount();
+    const syncedCustomer = customer || queued.customer;
+    if (type === "register") return syncedCustomer;
+    return {
+      customer: syncedCustomer,
+      offers: queued.offers || [],
+      replay: !!queued.existing,
+      pending: !!pending,
+      syncError: S.syncError,
+    };
+  }
+  const requestId = await Offline.requestIdForKey(key);
   try {
-    const j = await api(path, Object.assign({}, body, { request_id: PEND[key] }), true);
-    delete PEND[key]; savePend(); return j;
-  } catch (e) { if (!e.net) { delete PEND[key]; savePend(); } throw e; }
+    const result = await api(path, Object.assign({}, body, { request_id: requestId }), true);
+    await Offline.clearRequestIdForKey(key);
+    return result;
+  } catch (e) {
+    if (!e.net) await Offline.clearRequestIdForKey(key);
+    throw e;
+  }
 }
 function toast(msg, err) {
   const t = $("#toast");
@@ -52,24 +142,79 @@ function toast(msg, err) {
 $("#toast").addEventListener("click", () => ($("#toast").hidden = true));
 const fio = (c) => `${c.surname || ""} ${c.name || ""}`.trim();
 function modal(html) { const m = $("#modal"); m.innerHTML = "<div>" + html + "</div>"; m.hidden = false; }
-function closeModal() { $("#modal").hidden = true; $("#modal").innerHTML = ""; stopScan(); }
+function closeModal() {
+  $("#modal").hidden = true; $("#modal").innerHTML = ""; stopScan();
+  if (qrObjectUrl) URL.revokeObjectURL(qrObjectUrl);
+  qrObjectUrl = null;
+}
 async function guard(fn) {
   if (busy) return; busy = true;
   try { await fn(); } catch (e) { toast(e.message, true); } finally { busy = false; }
 }
-async function refreshState() { Object.assign(S, await api("state")); }
+async function refreshState() {
+  Object.assign(S, await api("state"));
+  if (S.role) await Offline.cacheProducts(S);
+}
 
 // ---------- маршрутизация
 const route = () => (location.hash.replace(/^#/, "") || "/").split("?")[0].split("/").filter(Boolean);
 const go = (h) => { if (location.hash === "#" + h) render(); else location.hash = h; };
 window.addEventListener("hashchange", () => { cart = {}; selDrink = null; render(); });
 
-async function boot() { try { await refreshState(); } catch (e) { toast(e.message, true); } render(); }
+async function boot() {
+  await Offline.open();
+  await Offline.persistentStorage();
+  S.server_url = await Offline.serverUrl();
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => 0);
+  if (isPagesHost && !(await Offline.serverUrl())) {
+    $("#app").innerHTML = viewConnection();
+    return;
+  }
+  let unavailable = false;
+  try { await refreshState(); } catch (e) { unavailable = true; }
+  if (!S.role && (unavailable || !navigator.onLine)) {
+    try {
+      const cached = await Offline.bootstrap();
+      if (cached.authenticated && cached.config) {
+        S.role = "staff";
+        S.shop = cached.config.shop;
+        S.drinks = cached.config.drinks.filter((drink) => drink.active !== false);
+        S.offline = true;
+      }
+    } catch (e) { toast(e.message, true); }
+  }
+  if (S.role && navigator.onLine) {
+    try {
+      await Offline.synchronize(api);
+      S.offline = false;
+      S.syncError = null;
+    } catch (e) {
+      S.offline = true;
+      S.syncError = e.message;
+    }
+  }
+  await updateOfflineStatus();
+  render();
+}
+
+function offlineNotice() {
+  if (!S.offline && !S.pendingCount) return "";
+  const heading = S.offline ? "Офлайн-режим." : `Ожидает синхронизации: ${S.pendingCount}.`;
+  const detail = S.offline ? "Данные и покупки сохраняются на этом телефоне и будут отправлены при восстановлении связи."
+    : "Проверьте сеть и сервер; ожидающие операции остаются на телефоне.";
+  return `<div class="warn offline-note"><b>${heading}</b> ${detail}${S.syncError ? `<br>${esc(S.syncError)}` : ""}${S.pendingError ? `<br>⚠ ${esc(S.pendingError)}` : ""}</div>`;
+}
+async function updateOfflineStatus() {
+  const entries = await Offline.pending();
+  S.pendingCount = entries.length;
+  S.pendingError = (entries.find((entry) => entry.last_error) || {}).last_error?.message || "";
+}
 
 async function render() {
   const app = $("#app");
   app.style.paddingBottom = "";
   if (S.locked) return await viewLocked();
+  if (isPagesHost && !(await Offline.serverUrl())) return (app.innerHTML = viewConnection());
   if (S.setup_needed) return (app.innerHTML = viewSetup());
   if (!S.role) return (app.innerHTML = viewLogin());
   const r = route();
@@ -79,7 +224,8 @@ async function render() {
     if (r[0] === "stats") return await viewStats("week");
     if (r[0] === "customers") return await viewCustomers();
     if (r[0] === "settings") return await viewSettings();
-    await refreshState().catch(() => 0);
+    await refreshState().catch((e) => { if (e.net) S.offline = true; });
+    if (!S.role) return (app.innerHTML = viewLogin());
     app.innerHTML = viewHome(); loadSearch(lastQuery);
   } catch (e) { toast(e.message, true); if (r.length) go("/"); }
 }
@@ -114,14 +260,25 @@ function viewSetup() {
   <button class="btn primary block" data-act="setup">Сохранить</button></div>`;
 }
 function viewLogin() {
+  const serverForm = isPagesHost || S.server_url ? `<div class="card"><b>Сервер ноутбука</b>
+  <label>HTTPS-адрес в сети Wi-Fi</label><input id="server_url" type="url" inputmode="url" value="${esc(S.server_url || "")}" placeholder="https://192.168.1.25:8443" autocomplete="url">
+  <button class="btn block" style="margin-top:10px" data-act="connectserver">Сохранить адрес сервера</button></div>` : "";
   return `<div class="top"><div class="t">${esc(S.shop)}</div></div>
   <div class="card center"><h2>Введите PIN</h2><input id="pin" class="pin" type="password" inputmode="numeric" autocomplete="off">
-  <button class="btn primary block" style="margin-top:12px" data-act="login">Войти</button></div>`;
+  <button class="btn primary block" style="margin-top:12px" data-act="login">Войти</button></div>${serverForm}`;
+}
+function viewConnection() {
+  return `<div class="top"><div class="t">Подключение к серверу магазина</div></div>
+  <div class="card"><p>Укажите HTTPS-адрес ноутбука, запущенного в той же Wi-Fi сети, например <b>https://192.168.1.25:8443</b>.</p>
+  <label>Адрес локального сервера</label><input id="server_url" type="url" inputmode="url" placeholder="https://192.168.1.25:8443" autocomplete="url">
+  <p class="mute">Перед подключением установите сертификат ноутбука на iPhone: откройте в Safari адрес сервера с <code>/ca.crt</code>, установите профиль и включите доверие сертификату в настройках iOS.</p>
+  <button class="btn primary block" data-act="connectserver">Сохранить и подключиться</button></div>`;
 }
 
 // ---------- главная: поиск
 function viewHome() {
   return `${hdr(S.shop)}
+  ${offlineNotice()}
   ${(S.warnings || []).map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join("")}
   <div class="row"><div class="grow"><input id="q" type="search" inputmode="${searchMode}" placeholder="Телефон или фамилия" autocomplete="off" value="${esc(lastQuery)}"></div>
   <button class="iconbtn" style="height:54px" data-act="mode">${searchMode === "tel" ? "Аб" : "123"}</button></div>
@@ -132,7 +289,13 @@ let sTimer;
 async function loadSearch(q) {
   lastQuery = q;
   const box = $("#results"); if (!box) return;
-  const j = await api("search?q=" + encodeURIComponent(q)).catch(() => null);
+  let j;
+  try { j = await api("search?q=" + encodeURIComponent(q)); }
+  catch (e) {
+    if (!e.net) { toast(e.message, true); return; }
+    try { j = await Offline.search(q); S.offline = true; await updateOfflineStatus(); }
+    catch (e) { box.innerHTML = `<div class="warn">${esc(e.message)}</div>`; return; }
+  }
   if (!j || q !== lastQuery || !$("#results")) return;
   if (!j.results.length) {
     box.innerHTML = q ? `<div class="card center mute">Не найдено.<br><button class="btn primary" style="margin-top:10px" data-act="newc">Зарегистрировать</button></div>` : `<div class="card center mute">Введите номер телефона или фамилию, либо отсканируйте QR</div>`;
@@ -154,16 +317,36 @@ function qrModal(c, fresh) {
   qrFresh = fresh;
   modal(`<h2 class="center">${fresh ? "Клиент добавлен" : "QR-код клиента"}</h2>
   <div class="center"><b>${esc(fio(c))}</b><div class="mute">${esc(c.phone_fmt)}</div></div>
-  <img class="qr" alt="QR" src="/api/qr/${esc(c.id)}.png?t=${Date.now()}">
+  ${c.pending ? `<div class="warn">Клиент сохранён на телефоне. QR-код появится после синхронизации с сервером.</div>` : `
+  <img class="qr" id="qr-image" alt="QR" src="">
   <p class="mute center">В QR записан только код клиента. Клиент сохраняет картинку в телефон; при визите продавец сканирует её кнопкой «Сканировать QR».</p>
-  <div class="row"><a class="btn grow" href="/api/qr/${esc(c.id)}.png" download="qr-${esc(c.id)}.png">⬇ Скачать</a><button class="btn grow" data-act="shareqr" data-id="${esc(c.id)}">↗ Отправить</button></div>
+  <div class="row"><button class="btn grow" data-act="downloadqr" data-id="${esc(c.id)}">⬇ Скачать</button><button class="btn grow" data-act="shareqr" data-id="${esc(c.id)}">↗ Отправить</button></div>`}
   <button class="btn primary block" style="margin-top:10px" data-act="closem">${fresh ? "Открыть карточку" : "Закрыть"}</button>`);
+  if (!c.pending) loadQrImage(c.id);
+}
+async function loadQrImage(id) {
+  try {
+    const blob = await apiBlob("qr/" + encodeURIComponent(id) + ".png");
+    if ($("#qr-image")) {
+      qrObjectUrl = URL.createObjectURL(blob);
+      $("#qr-image").src = qrObjectUrl;
+    }
+  } catch (e) { toast(e.message, true); }
 }
 
 // ---------- карточка клиента
 async function viewCustomer(id) {
-  await refreshState();
-  C = await api("customers/" + encodeURIComponent(id));
+  try { await refreshState(); }
+  catch (e) { if (!e.net) throw e; S.offline = true; }
+  try {
+    C = await api("customers/" + encodeURIComponent(id));
+    await Offline.cacheCustomer(C);
+  } catch (e) {
+    if (!e.net) throw e;
+    S.offline = true;
+    C = await Offline.getCustomer(id);
+    if (!C) throw new Error("Клиент не сохранён на этом телефоне. Подключитесь к серверу и повторите.");
+  }
   if (S.drinks.length === 1 && !selDrink) selDrink = S.drinks[0].id;
   paintCustomer();
 }
@@ -183,8 +366,9 @@ function paintCustomer() {
   const c = C, per = Object.fromEntries(c.per_drink.map((p) => [p.drink, p]));
   const sel = S.drinks.find((d) => d.id === selDrink);
   $("#app").innerHTML = `${hdr(fio(c), true)}
+  ${offlineNotice()}
   <div class="card"><div class="row"><div class="grow"><div class="mute">${esc(c.phone_fmt)}</div><div class="mute">Клиент с ${fd(c.created)} · визитов: ${c.visits}</div></div>
-    <button class="iconbtn" data-act="showqr">QR</button><button class="iconbtn" data-act="editc">✎</button></div></div>
+    ${S.offline || c.pending ? "" : `<button class="iconbtn" data-act="showqr">QR</button><button class="iconbtn" data-act="editc">✎</button>`}</div></div>
   <div class="kpi three"><div><span class="mute">Куплено всего</span><b>${fl(c.total_paid)}</b></div>
     <div><span class="mute">Подарок доступен</span><b style="color:var(--green)">${fl(c.gifts_avail)}</b></div>
     <div><span class="mute">Подарок списан</span><b>${fl(c.gifts_used)}</b></div></div>
@@ -197,7 +381,7 @@ function paintCustomer() {
     <button class="btn" ${sel && cart[selDrink] ? "" : "disabled"} data-act="volminus">−0,5</button></div>
   <h2>История</h2><div class="card hist">${(c.history || []).map((h) =>
     `<div class="it ${h.undone ? "undone" : ""}"><div class="grow">${h.type === "redeem" ? "🎁 Подарок: " : ""}${h.items.map((i) => esc(i.emoji) + " " + esc(i.name) + " " + fl(i.liters)).join(", ")}
-    <div class="mute">${fdt(h.ts)}${h.undone ? " · отменено" : ""}</div></div>${h.undone ? "" : `<button class="btn sm danger" data-act="undo" data-id="${h.id}">Отмена</button>`}</div>`).join("") || `<div class="mute">Пока пусто</div>`}</div>
+    <div class="mute">${fdt(h.ts)}${h.undone ? " · отменено" : ""}${h.pending ? " · ожидает синхронизации" : ""}</div></div>${h.undone || h.pending || S.offline ? "" : `<button class="btn sm danger" data-act="undo" data-id="${h.id}">Отмена</button>`}</div>`).join("") || `<div class="mute">Пока пусто</div>`}</div>
   ${cartBar()}`;
   fitCart();
 }
@@ -257,6 +441,10 @@ function undoModal(p) {
 
 // ---------- статистика магазина
 async function viewStats(period) {
+  if (S.offline) {
+    $("#app").innerHTML = `${hdr("Статистика", true)}${offlineNotice()}<div class="card mute">Статистика магазина будет доступна после подключения к серверу.</div>`;
+    return;
+  }
   const j = await api("stats?period=" + period), max = Math.max(1, ...j.days.map((d) => d.liters));
   $("#app").innerHTML = `${hdr("Статистика", true)}
   <div class="tabs">${[["today", "Сегодня"], ["week", "7 дней"], ["month", "30 дней"], ["all", "Всё"]].map(([k, n]) => `<button class="chip ${k === period ? "on" : ""}" data-act="period" data-p="${k}">${n}</button>`).join("")}</div>
@@ -280,6 +468,10 @@ const SORTS = {
   name: ["Имя", (a, b) => fio(a).localeCompare(fio(b), "ru")],
 };
 async function viewCustomers() {
+  if (S.offline) {
+    $("#app").innerHTML = `${hdr("Все покупатели", true)}${offlineNotice()}<div class="card mute">Полная сводная статистика будет доступна после подключения к серверу. Клиентов можно искать в основном окне.</div>`;
+    return;
+  }
   CS.data = await api("customers-stats"); CS.open = null;
   const t = CS.data.totals;
   $("#app").innerHTML = `${hdr("Все покупатели", true)}
@@ -289,7 +481,7 @@ async function viewCustomers() {
   <div style="margin-top:12px"><input id="cq" type="search" placeholder="Поиск по имени или телефону" value="${esc(CS.q)}" autocomplete="off"></div>
   <div class="chips" style="margin:10px 0">${Object.entries(SORTS).map(([k, v]) => `<button class="chip ${CS.sort === k ? "on" : ""}" data-act="csort" data-k="${k}">${v[0]}</button>`).join("")}</div>
   <div id="cl" class="list"></div>
-  <a class="btn block" href="/api/export.csv">⬇ Выгрузить всех в Excel</a>`;
+  <button class="btn block" data-act="exportcsv">⬇ Выгрузить всех в Excel</button>`;
   paintCl();
 }
 function paintCl() {
@@ -309,8 +501,26 @@ function paintCl() {
 
 // ---------- настройки
 async function viewSettings() {
-  const j = await api("settings");
+  const configuredServer = await Offline.serverUrl();
+  let j = null;
+  try { j = await api("settings"); }
+  catch (e) { if (!S.offline) throw e; }
+  await updateOfflineStatus();
+  if (!j) {
+    const cached = await Offline.bootstrap();
+    $("#app").innerHTML = `${hdr("Настройки", true)}${offlineNotice()}
+      <div class="card"><b>Сервер ноутбука</b><label>HTTPS-адрес в сети Wi-Fi</label>
+      <input id="server_url" type="url" inputmode="url" value="${esc(configuredServer)}" placeholder="https://192.168.1.25:8443" autocomplete="url">
+      <button class="btn block" style="margin-top:10px" data-act="connectserver">Сохранить адрес сервера</button>
+      <p class="mute">Нужен адрес HTTPS из окна программы. Для смены сервера сначала синхронизируйте или экспортируйте очередь.</p></div>
+      <div class="card"><b>Локальные данные</b><div class="mute">Сохранено напитков: ${cached.config ? cached.config.drinks.length : 0}<br>Последний применённый курсор: ${cached.cursor}</div>
+      <button class="btn primary block" style="margin-top:10px" data-act="syncnow">Синхронизировать сейчас</button>
+      <button class="btn block" style="margin-top:8px" data-act="exportpending">Экспортировать ожидающие операции</button></div>
+      <div class="card mute">PIN и серверные настройки доступны при подключении к компьютеру магазина.</div>`;
+    return;
+  }
   $("#app").innerHTML = `${hdr("Настройки", true)}
+  ${offlineNotice()}
   <div class="card"><b>Напитки и название магазина</b>
   <p class="mute">Список редактируется в файле <b>settings.json</b> (в папке программы) обычным Блокнотом: добавьте строку напитка, сохраните файл и обновите страницу. Название, эмодзи и цвет плитки задаются там же.</p>
   ${j.settings_error ? `<div class="warn">⚠ Ошибка в файле: ${esc(j.settings_error)}<br>Пока она не исправлена, действует прежний список.</div>` : ""}
@@ -318,12 +528,19 @@ async function viewSettings() {
   <div class="card"><b>Сменить PIN</b><label>Текущий PIN</label><input id="p_cur" type="password" inputmode="numeric" autocomplete="off">
   <label>Новый PIN (4–12 цифр)</label><input id="p_new" type="password" inputmode="numeric" autocomplete="off">
   <button class="btn primary block" style="margin-top:12px" data-act="savepin">Сохранить PIN</button></div>
+  <div class="card"><b>Сервер ноутбука</b><label>HTTPS-адрес в сети Wi-Fi</label>
+  <input id="server_url" type="url" inputmode="url" value="${esc(configuredServer)}" placeholder="https://192.168.1.25:8443" autocomplete="url">
+  <button class="btn block" style="margin-top:10px" data-act="connectserver">Сохранить адрес сервера</button>
+  <p class="mute">Для безопасности смена адреса доступна только при пустой очереди синхронизации. При смене сервера локальный кэш очищается.</p></div>
   <div class="card"><b>Сертификат (чтобы не было предупреждений)</b>
-  <div class="mute"><b>iPhone:</b> откройте <a href="/ca.crt">/ca.crt</a> → «Разрешить» → Настройки → вверху «Профиль загружен» → Установить. Затем Настройки → Основные → Об этом устройстве → Доверие сертификатам → включите «Pivo Loyalty Local CA». Делается один раз.<br>
+  <div class="mute"><b>iPhone:</b> откройте <a href="${esc((configuredServer || location.origin) + "/ca.crt")}" target="_blank" rel="noopener">сертификат локального сервера</a> → «Разрешить» → Настройки → «Профиль загружен» → Установить. Затем Настройки → Основные → Об этом устройстве → Доверие сертификатам → включите «Pivo Loyalty Local CA». Делается один раз.<br>
   <b>Windows:</b> запустите install-cert.bat из папки программы. После этого перезапустите браузер.<br>
   Сертификат сервера продлевается сам, повторно ставить ничего не нужно.</div></div>
   <div class="card"><b>Резервные копии</b><div class="mute">Копий: ${j.backups}. Последняя: ${esc(j.last_backup || "—")} ${j.backup_ok === true ? "· проверена ✓" : j.backup_ok === false ? "· <b>не прошла проверку</b>: " + esc(j.backup_error) : ""}<br>Папка с данными: ${esc(j.data_dir)}</div>
-  <button class="btn block" style="margin-top:10px" data-act="backup">Сделать копию сейчас</button></div>`;
+  <button class="btn block" style="margin-top:10px" data-act="backup">Сделать копию сейчас</button></div>
+  <div class="card"><b>Офлайн-синхронизация</b><div class="mute">Ожидает отправки: ${S.pendingCount || 0}</div>
+  <button class="btn primary block" style="margin-top:10px" data-act="syncnow">Синхронизировать сейчас</button>
+  <button class="btn block" style="margin-top:8px" data-act="exportpending">Экспортировать ожидающие операции</button></div>`;
 }
 
 // ---------- сканер QR (камера + запасной вариант: фото)
@@ -391,7 +608,22 @@ document.addEventListener("input", (e) => {
 
 });
 document.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.id === "pin") guard(doLogin); });
-async function doLogin() { const j = await api("login", { pin: $("#pin").value }); S.role = j.role; await refreshState(); render(); }
+async function doLogin() {
+  const j = await api("login", { pin: $("#pin").value });
+  S.role = j.role;
+  await Offline.rememberAuthentication(true, j.token);
+  await refreshState();
+  try {
+    await Offline.synchronize(api);
+    S.offline = false;
+    S.syncError = null;
+  } catch (e) {
+    S.offline = true;
+    S.syncError = e.message;
+  }
+  await updateOfflineStatus();
+  render();
+}
 
 document.addEventListener("click", (e) => {
   const el = e.target.closest("[data-act]"); if (!el || el.tagName === "A") return;
@@ -416,7 +648,23 @@ document.addEventListener("click", (e) => {
       closeModal(); await refreshState(); toast("База восстановлена"); render();
     });
     case "closem": { const f = qrFresh; qrFresh = false; closeModal(); if (f && C) go("/c/" + C.id); return; }
-    case "logout": return run(async () => { closeModal(); await api("logout", {}); S.role = null; S.drinks = []; render(); });
+    case "logout": return run(async () => {
+      closeModal();
+      await api("logout", {}).catch(() => 0);
+      await Offline.rememberAuthentication(false);
+      S.role = null; S.drinks = []; render();
+    });
+    case "connectserver": return run(async () => {
+      const address = validateServerAddress($("#server_url").value);
+      await Offline.setServerUrl(address);
+      S.server_url = address;
+      S.role = null;
+      S.offline = false;
+      await Offline.rememberAuthentication(false);
+      Object.assign(S, await api("state"));
+      toast("Адрес сервера сохранён");
+      render();
+    });
     case "setup": return run(async () => { await api("setup", { pin: $("#s_pin").value }); await refreshState(); toast("Готово. Войдите с PIN"); render(); });
     case "login": return run(doLogin);
     case "mode": searchMode = searchMode === "tel" ? "text" : "tel"; $("#app").innerHTML = viewHome(); $("#q").focus(); return loadSearch(lastQuery);
@@ -426,13 +674,26 @@ document.addEventListener("click", (e) => {
     case "register": return run(async () => {
       const f = { phone: $("#n_phone").value, name: $("#n_name").value, surname: $("#n_sur").value };
       C = await mut("reg:" + JSON.stringify(f), "customers", f);
-      toast(C.replay ? "Клиент уже был добавлен: повтор не создан" : "Клиент добавлен"); qrModal(C, true);
+      await updateOfflineStatus();
+      toast(C.pending ? "Клиент сохранён на телефоне; ожидает синхронизации" : "Клиент добавлен");
+      qrModal(C, true);
     });
     case "showqr": return qrModal(C, false);
     case "shareqr": return run(async () => {
-      const b = await (await fetch("/api/qr/" + d.id + ".png")).blob(), f = new File([b], "qr-" + d.id + ".png", { type: "image/png" });
+      const b = await apiBlob("qr/" + encodeURIComponent(d.id) + ".png"), f = new File([b], "qr-" + d.id + ".png", { type: "image/png" });
       if (navigator.canShare && navigator.canShare({ files: [f] })) await navigator.share({ files: [f], title: "QR-карта" });
       else toast("Нажмите «Скачать» и отправьте файл клиенту");
+    });
+    case "downloadqr": return run(async () => {
+      const blob = await apiBlob("qr/" + encodeURIComponent(d.id) + ".png");
+      const url = URL.createObjectURL(blob), link = document.createElement("a");
+      link.href = url; link.download = "qr-" + d.id + ".png"; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    case "exportcsv": return run(async () => {
+      const blob = await apiBlob("export.csv"), url = URL.createObjectURL(blob), link = document.createElement("a");
+      link.href = url; link.download = "klienty.csv"; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
     case "seld": selDrink = d.d; return paintCustomer();
     case "vol": if (!selDrink) return toast("Сначала выберите напиток", true); cart[selDrink] = (cart[selDrink] || 0) + Math.round(parseFloat(d.v) * 2); return paintCustomer();
@@ -441,7 +702,8 @@ document.addEventListener("click", (e) => {
     case "buy": return run(async () => {
       const items = Object.keys(cart).filter((k) => cart[k] > 0).map((k) => ({ drink: k, liters: cart[k] / 2 }));
       const j = await mut("buy:" + C.id + JSON.stringify(items), "customers/" + C.id + "/purchase", { items });
-      C = j.customer; cart = {}; paintCustomer(); toast(j.replay ? "Эта покупка уже была записана: повтор не создан" : "Записано");
+      C = j.customer; cart = {}; await updateOfflineStatus(); paintCustomer();
+      toast(C.pending ? "Покупка сохранена на телефоне; ожидает синхронизации" : "Записано");
       if (j.offers.length) redeemModal(j.offers[0].avail, true);
     });
     case "redeem": return redeemModal(C.gifts_avail, false);
@@ -454,9 +716,13 @@ document.addEventListener("click", (e) => {
       const items = Object.keys(RD.items).map((k) => ({ drink: k, liters: RD.items[k] / 2 })), body = { items };
       if (!items.length) return toast("Выберите пиво и объём", true);
       const j = await mut("red:" + C.id + JSON.stringify(items), "customers/" + C.id + "/redeem", body);
-      C = j.customer; closeModal(); paintCustomer(); toast(j.replay ? "Это списание уже было записано: повтор не создан" : "Подарок списан");
+      C = j.customer; await updateOfflineStatus(); closeModal(); paintCustomer();
+      toast(C.pending ? "Списание сохранено на телефоне; ожидает синхронизации" : "Подарок списан");
     });
-    case "undo": return run(async () => undoModal((await api("ops/" + d.id + "/undo", {})).preview));
+    case "undo": return run(async () => {
+      if (!navigator.onLine || S.offline) throw new Error("Отмена доступна после подключения к серверу.");
+      return undoModal((await api("ops/" + d.id + "/undo", {})).preview);
+    });
     case "undook": return run(async () => {
       const j = await mut("undo:" + d.id, "ops/" + d.id + "/undo", { confirm: true });
       C = j.customer; closeModal(); paintCustomer(); toast("Операция отменена");
@@ -472,7 +738,51 @@ document.addEventListener("click", (e) => {
     case "rowtoggle": CS.open = CS.open === d.id ? null : d.id; return paintCl();
     case "savepin": return run(async () => { await api("settings", { current_pin: $("#p_cur").value, new_pin: $("#p_new").value }); toast("PIN изменён"); await viewSettings(); });
     case "backup": return run(async () => { const j = await api("backup", {}); toast("Копия создана: " + j.name); await viewSettings(); });
+    case "syncnow": return run(async () => {
+      if (!navigator.onLine) throw new Error("Нет подключения к серверу. Ожидающие операции сохранены.");
+      await Offline.synchronize(api);
+      S.offline = false; S.syncError = null;
+      await updateOfflineStatus(); toast(S.pendingCount ? `Осталось синхронизировать: ${S.pendingCount}` : "Синхронизация завершена");
+      await render();
+    });
+    case "exportpending": return run(async () => { await Offline.exportPending(); toast("Экспорт ожидающих операций создан"); });
   }
 });
+
+let retryDelay = 1000, retryTimer = null;
+async function retrySynchronization() {
+  if (!S.role || !navigator.onLine) return;
+  try {
+    await Offline.synchronize(api);
+    retryDelay = 1000;
+    S.offline = false;
+    S.syncError = null;
+    await updateOfflineStatus();
+    const r = route();
+    if (r[0] === "c" && r[1]) {
+      C = await Offline.getCustomer(r[1]) || C;
+      if (C) paintCustomer();
+    } else if (r[0] === "settings") {
+      await viewSettings();
+    }
+  } catch (e) {
+    S.offline = true;
+    S.syncError = e.message;
+    await updateOfflineStatus().catch(() => 0);
+    if (!retryTimer && S.role) {
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        retryDelay = Math.min(retryDelay * 2, 300000);
+        retrySynchronization();
+      }, retryDelay);
+    }
+  }
+}
+window.addEventListener("online", retrySynchronization);
+window.addEventListener("offline", () => { S.offline = true; render(); });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) retrySynchronization();
+});
+setInterval(() => { if (navigator.onLine) retrySynchronization(); }, 30000);
 
 boot();

@@ -158,10 +158,12 @@ def t_ttl():
         env.stop()
         d = json.load(open(env.data_file, encoding="utf-8"))
         d["requests"]["old-request-0001"] = {"fp": "x", "ts": "2020-01-01T00:00:00", "kind": "purchase", "cid": cid}
+        d["requests"]["sync-old-operation"] = {"fp": "x", "sync_fp": "y", "ts": "2020-01-01T00:00:00", "kind": "purchase", "cid": cid}
         json.dump(d, open(env.data_file, "w", encoding="utf-8"), ensure_ascii=False)
         env.start()
         d = json.load(open(env.data_file, encoding="utf-8"))
         check("old-request-0001" not in d["requests"] and "buy-seed-0001" in d["requests"], "ID старше 30 дней удаляются, свежие остаются")
+        check("sync-old-operation" in d["requests"], "идентификатор синхронизации не удаляется по TTL")
     finally:
         env.stop()
 
