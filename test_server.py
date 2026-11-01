@@ -326,7 +326,8 @@ def main():
               any(icon.get("sizes") == "512x512" for icon in manifest.get("icons", [])) and
               "application/manifest+json" in s.last_headers.get("content-type", ""), "PWA manifest отдаётся с корректным MIME-типом и иконками")
         st, body = s.call("GET", "/sw.js", raw=True)
-        check(st == 200 and b"APP_SHELL" in body and b"/api/" in body, "service worker кэширует оболочку, но пропускает API")
+        check(st == 200 and b"APP_SHELL" in body and b"/api/" in body and b"pivo-shell-v6" in body,
+              "service worker обновляет оболочку приложения, но пропускает API")
         check(b"LOCAL_ADMIN_HOST" in body and b'url.pathname === "/admin.html"' in body,
               "service worker не подменяет локальную панель кэшированным приложением")
         st, body = s.call("GET", "/offline.js", raw=True)

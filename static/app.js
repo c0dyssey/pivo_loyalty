@@ -216,6 +216,9 @@ async function boot() {
 }
 
 function registerApplicationWorker() {
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (document.visibilityState === "visible") location.reload();
+  });
   navigator.serviceWorker.register("./sw.js").then((registration) => {
     const activateVerifiedUpdate = (worker) => {
       if (worker && worker.state === "installed" && navigator.serviceWorker.controller) {

@@ -1,6 +1,6 @@
 "use strict";
 
-const CACHE = "pivo-shell-v5";
+const CACHE = "pivo-shell-v6";
 const BASE = new URL(".", self.registration.scope);
 const LOCAL_ADMIN_HOST = new Set(["localhost", "127.0.0.1", "::1"]).has(self.location.hostname);
 const APP_SHELL = [
@@ -55,19 +55,14 @@ self.addEventListener("fetch", (event) => {
   if (!APP_PATHS.has(url.pathname) && request.mode !== "navigate") return;
   event.respondWith((async () => {
     const cache = await caches.open(CACHE);
-    const cached = await cache.match(request) ||
-      (request.mode === "navigate" ? await cache.match(new URL("index.html", BASE).href) : null);
-    if (cached) {
-      event.waitUntil(fetch(request).then(async (response) => {
-        if (response.ok && APP_PATHS.has(url.pathname)) await cache.put(request, response);
-      }).catch(() => {}));
-      return cached;
-    }
     try {
       const response = await fetch(request);
       if (response.ok && APP_PATHS.has(url.pathname)) await cache.put(request, response.clone());
       return response;
     } catch (error) {
+      const cached = await cache.match(request) ||
+        (request.mode === "navigate" ? await cache.match(new URL("index.html", BASE).href) : null);
+      if (cached) return cached;
       throw error;
     }
   })());
